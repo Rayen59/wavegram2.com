@@ -4,5 +4,3 @@ Flask-Cors
 bcrypt
 PyJWT
 gunicorn
-gevent
-gevent-websocket
