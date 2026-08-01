@@ -1,0 +1,6 @@
+Flask
+Flask-SocketIO
+Flask-Cors
+bcrypt
+PyJWT
+gunicorn
