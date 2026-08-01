@@ -91,6 +91,7 @@ def init_db():
             email TEXT UNIQUE NOT NULL,
             username TEXT NOT NULL,
             password_hash TEXT NOT NULL,
+            token TEXT,
             avatar TEXT DEFAULT '',
             status TEXT DEFAULT 'offline',
             created_at REAL NOT NULL
@@ -312,36 +313,39 @@ def auth_required(f):
 
 @app.route("/api/register", methods=["POST"])
 def register():
-    data = request.get_json(force=True) or {}
-    email = (data.get("email") or "").strip().lower()
-    username = (data.get("username") or "").strip()
-    password = data.get("password") or ""
+    try:
+        data = request.get_json(silent=True) or request.form or {}
+        email = (data.get("email") or "").strip().lower()
+        username = (data.get("username") or "").strip()
+        password = data.get("password") or ""
 
-    if not email or "@" not in email:
-        return jsonify({"error": "Please provide a valid email address"}), 400
-    if not username:
-        return jsonify({"error": "Username is required"}), 400
-    if len(password) < 4:
-        return jsonify({"error": "Password must be at least 4 characters"}), 400
+        if not email or "@" not in email:
+            return jsonify({"error": "Please provide a valid email address"}), 400
+        if not username:
+            return jsonify({"error": "Username is required"}), 400
+        if len(password) < 4:
+            return jsonify({"error": "Password must be at least 4 characters"}), 400
 
-    db = get_db()
-    existing = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
-    if existing:
-        return jsonify({"error": "This email has already been used to create an account"}), 409
+        db = get_db()
+        existing = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+        if existing:
+            return jsonify({"error": "This email has already been used to create an account"}), 409
 
-    token = new_token()
-    db.execute(
-        "INSERT INTO users(email, username, password_hash, token, status, created_at) "
-        "VALUES (?,?,?,?,?,?)",
-        (email, username, hash_pw(password), token, "online", time.time()),
-    )
-    db.commit()
-    user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-    return jsonify({"token": token, "user": user_public(user)})
+        token = new_token()
+        db.execute(
+            "INSERT INTO users(email, username, password_hash, token, status, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (email, username, hash_pw(password), token, "online", time.time()),
+        )
+        db.commit()
+        user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        return jsonify({"token": token, "user": user_public(user)})
+    except Exception as e:
+        return jsonify({"error": f"Server error during registration: {str(e)}"}), 500
 
 @app.route("/api/login", methods=["POST"])
 def login():
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or request.form or {}
     email = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
     db = get_db()
@@ -365,7 +369,7 @@ def logout():
 @app.route("/api/account", methods=["DELETE"])
 @auth_required
 def delete_account():
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or {}
     password = data.get("password") or ""
     if not verify_pw(password, g.user["password_hash"]):
         return jsonify({"error": "Incorrect password"}), 403
@@ -439,7 +443,6 @@ def conversations():
     uid = g.user["id"]
     convos = []
 
-    # Get DM conversations
     dm_chat_ids = db.execute("SELECT DISTINCT chat_id FROM messages WHERE chat_type='dm'").fetchall()
     for row in dm_chat_ids:
         cid = row["chat_id"]
@@ -478,7 +481,6 @@ def conversations():
             "unread": unread,
         })
 
-    # Get group conversations
     group_rows = db.execute(
         """SELECT g.*, m.role FROM groups g JOIN group_members m ON m.group_id = g.id
            WHERE m.user_id=?""", (uid,)
@@ -553,7 +555,7 @@ def search_users():
 @app.route("/api/block", methods=["POST"])
 @auth_required
 def block_user():
-    target_id = (request.get_json(force=True) or {}).get("user_id")
+    target_id = (request.get_json(silent=True) or {}).get("user_id")
     db = get_db()
     db.execute("INSERT OR IGNORE INTO blocks(blocker_id, blocked_id) VALUES (?,?)",
                (g.user["id"], target_id))
@@ -563,7 +565,7 @@ def block_user():
 @app.route("/api/unblock", methods=["POST"])
 @auth_required
 def unblock_user():
-    target_id = (request.get_json(force=True) or {}).get("user_id")
+    target_id = (request.get_json(silent=True) or {}).get("user_id")
     db = get_db()
     db.execute("DELETE FROM blocks WHERE blocker_id=? AND blocked_id=?", (g.user["id"], target_id))
     db.commit()
@@ -596,7 +598,7 @@ def list_blocked():
 @app.route("/api/groups", methods=["POST"])
 @auth_required
 def create_group():
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
     password = data.get("password") or ""
     if not name:
@@ -616,7 +618,6 @@ def create_group():
     )
     db.commit()
     
-    # Return full group info with invite link
     return jsonify({
         "group": {
             "id": gid,
@@ -656,7 +657,7 @@ def my_groups():
 @app.route("/api/groups/join/<token>", methods=["POST"])
 @auth_required
 def join_group(token):
-    password = (request.get_json(force=True) or {}).get("password", "")
+    password = (request.get_json(silent=True) or {}).get("password", "")
     db = get_db()
     grp = db.execute("SELECT * FROM groups WHERE invite_token=?", (token,)).fetchone()
     if not grp:
@@ -840,7 +841,6 @@ def delete_reel(rid):
     if not row or row["user_id"] != g.user["id"]:
         return jsonify({"error": "You can only delete your own reels"}), 403
     
-    # Delete the file
     try:
         path = row["media_path"].replace("/uploads/", "", 1)
         full = os.path.join(UPLOAD_DIR, path)
@@ -871,7 +871,7 @@ def view_reel(rid):
 @app.route("/api/reels/<int:rid>/react", methods=["POST"])
 @auth_required
 def react_reel(rid):
-    emoji = (request.get_json(force=True) or {}).get("emoji")
+    emoji = (request.get_json(silent=True) or {}).get("emoji")
     db = get_db()
     if not emoji:
         db.execute("DELETE FROM reel_reactions WHERE reel_id=? AND user_id=?", (rid, g.user["id"]))
@@ -908,7 +908,7 @@ def get_comments(rid):
 @app.route("/api/reels/<int:rid>/comments", methods=["POST"])
 @auth_required
 def post_comment(rid):
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or {}
     content = (data.get("content") or "").strip()
     parent_id = data.get("parent_id")
     if not content:
