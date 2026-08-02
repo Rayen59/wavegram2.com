@@ -182,6 +182,10 @@ def init_db():
     conn.commit()
     conn.close()
 
+# Initialisation automatique des tables au démarrage (requis pour Render / WSGI)
+with app.app_context():
+    init_db()
+
 # ===== HELPERS =====
 
 def dm_chat_id(uid1, uid2):
@@ -289,7 +293,6 @@ def rooms_for(chat_type, chat_id):
     return [f"group:{chat_id}"]
 
 def generate_invite_link(token):
-    """Generate a full international invite link for a group"""
     base_url = PUBLIC_BASE_URL.rstrip('/')
     return f"{base_url}/?join={token}"
 
@@ -1279,7 +1282,6 @@ def index():
     return send_from_directory(BASE_DIR, "hm.html")
 
 def try_start_public_tunnel():
-    """Best-effort attempt to give this server a real internet address."""
     global PUBLIC_BASE_URL
     if PUBLIC_BASE_URL and PUBLIC_BASE_URL != "http://localhost:5000":
         print(f"Using configured public URL: {PUBLIC_BASE_URL}")
@@ -1309,7 +1311,6 @@ def try_start_public_tunnel():
 # ===== RUN =====
 
 if __name__ == "__main__":
-    init_db()
     print("🚀 HM Chat Server starting on http://0.0.0.0:5000")
     print(f"📡 Invite links will use: {PUBLIC_BASE_URL}")
     try_start_public_tunnel()
