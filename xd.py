@@ -1,1317 +1,1166 @@
-"""
-HM Chat - Real-time messaging server
-Author: Med Rayen Bouazizi
-
-Single-file backend for an Android-style real-time chat application.
-Features: single-use email registration, session tokens, direct messages,
-groups with shareable invite links and optional admin password, profile
-pictures, media messages (image/video/voice), message deletion, emoji
-reactions, typing indicators, block/unblock, and full chat history so
-nothing is lost on a page refresh.
-
-Run:
-    pip install flask flask-socketio flask-cors bcrypt pyjwt
-    python3 hm.py
-Then open http://<server-ip>:5000 in the browser.
-"""
+# =============================================================================
+#  HM CHAT – SERVER (Python + Flask + Flask-SocketIO)
+#  Real-time messaging, calls, groups, reels, blocking, and more.
+#  Inspired by Telegram's speed and reliability.
+# =============================================================================
 
 import os
-import re
-import sqlite3
-import threading
+import json
 import uuid
-import time
 import hashlib
-import secrets
 import bcrypt
 import jwt
+import datetime
+import time
+import base64
 from functools import wraps
-from datetime import datetime, timedelta
-
-from flask import Flask, request, jsonify, send_from_directory, g
-from flask_socketio import SocketIO, join_room, emit
+from flask import Flask, request, jsonify, send_from_directory
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_cors import CORS
+from werkzeug.utils import secure_filename
+import threading
+import queue
 
 # ===== CONFIGURATION =====
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "hm.db")
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-AVATAR_DIR = os.path.join(UPLOAD_DIR, "avatars")
-MEDIA_DIR = os.path.join(UPLOAD_DIR, "media")
-os.makedirs(AVATAR_DIR, exist_ok=True)
-os.makedirs(MEDIA_DIR, exist_ok=True)
+PORT = int(os.environ.get('PORT', 3000))
+JWT_SECRET = os.environ.get('JWT_SECRET', 'hm_chat_super_secret_key_change_me')
+PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', '')
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'mp4', 'webm', 'mov', 'mp3', 'wav', 'ogg'}
 
-ALLOWED_MEDIA = {"png", "jpg", "jpeg", "gif", "webp", "mp4", "mov", "webm",
-                  "mp3", "wav", "ogg", "m4a", "3gp", "aac"}
-
-JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_hex(32))
-PUBLIC_BASE_URL = os.environ.get("HM_PUBLIC_URL", "").rstrip("/")
-MAX_CONTENT_LENGTH = 60 * 1024 * 1024  # 60 MB
-
-# If no public URL is set, use the local server address
-if not PUBLIC_BASE_URL:
-    PUBLIC_BASE_URL = "http://localhost:5000"
+# ===== DATABASE (In-memory for simplicity – use Redis/Postgres in production) =====
+DB = {
+    'users': {},          # user_id -> {id, username, email, password_hash, avatar, status, blocked_ids, created_at}
+    'sessions': {},       # token -> user_id
+    'messages': {},       # message_id -> {id, chat_type, chat_id, sender_id, sender_name, msg_type, content, media_path, timestamp, deleted, edited, reactions, reply_to, forwarded_from, client_id}
+    'conversations': {},  # composite_key "dm:user_id" or "group:group_id" -> {id, type, name, avatar, last_message, unread}
+    'groups': {},         # group_id -> {id, name, avatar, admin_id, members, invite_token, has_password, password_hash, created_at}
+    'reels': [],          # list of {id, author_id, author_name, author_avatar, media_path, media_type, caption, view_count, reactions, comments, created_at}
+    'comments': {},       # reel_id -> [comment]
+    'notifications': {},  # user_id -> [notification]
+}
 
 # ===== FLASK APP =====
-app = Flask(__name__, static_folder=None)
-app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
-app.config["SECRET_KEY"] = JWT_SECRET
-CORS(app, origins="*")
+app = Flask(__name__)
+app.config['SECRET_KEY'] = JWT_SECRET
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading",
-                     max_http_buffer_size=MAX_CONTENT_LENGTH)
+CORS(app, origins='*')
 
-# ===== DATABASE =====
+# Create upload folder if it doesn't exist
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-def get_db():
-    db = getattr(g, "_db", None)
-    if db is None:
-        db = g._db = sqlite3.connect(DB_PATH)
-        db.row_factory = sqlite3.Row
-    return db
+# ===== SOCKET.IO =====
+socketio = SocketIO(app, cors_allowed_origins='*', async_mode='eventlet', ping_timeout=60)
 
-@app.teardown_appcontext
-def close_db(_exc):
-    db = getattr(g, "_db", None)
-    if db is not None:
-        db.close()
-
-def db_conn():
-    """Standalone connection for use inside Socket.IO handlers (no app context)."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.executescript("""
-        CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            username TEXT NOT NULL,
-            password_hash TEXT NOT NULL,
-            token TEXT,
-            avatar TEXT DEFAULT '',
-            status TEXT DEFAULT 'offline',
-            created_at REAL NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS groups(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            creator_id INTEGER NOT NULL,
-            invite_token TEXT UNIQUE NOT NULL,
-            password_hash TEXT DEFAULT '',
-            avatar TEXT DEFAULT '',
-            created_at REAL NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS group_members(
-            group_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            role TEXT DEFAULT 'member',
-            joined_at REAL NOT NULL,
-            PRIMARY KEY(group_id, user_id)
-        );
-        CREATE TABLE IF NOT EXISTS messages(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_type TEXT NOT NULL,
-            chat_id TEXT NOT NULL,
-            sender_id INTEGER NOT NULL,
-            msg_type TEXT NOT NULL,
-            content TEXT DEFAULT '',
-            media_path TEXT DEFAULT '',
-            timestamp REAL NOT NULL,
-            deleted INTEGER DEFAULT 0,
-            reply_to_id INTEGER,
-            forwarded_from_id INTEGER,
-            edited INTEGER DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS reactions(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            emoji TEXT NOT NULL,
-            UNIQUE(message_id, user_id)
-        );
-        CREATE TABLE IF NOT EXISTS blocks(
-            blocker_id INTEGER NOT NULL,
-            blocked_id INTEGER NOT NULL,
-            PRIMARY KEY(blocker_id, blocked_id)
-        );
-        CREATE TABLE IF NOT EXISTS read_state(
-            user_id INTEGER NOT NULL,
-            chat_type TEXT NOT NULL,
-            chat_id TEXT NOT NULL,
-            last_read_id INTEGER DEFAULT 0,
-            PRIMARY KEY(user_id, chat_type, chat_id)
-        );
-        CREATE TABLE IF NOT EXISTS hidden_messages(
-            user_id INTEGER NOT NULL,
-            message_id INTEGER NOT NULL,
-            PRIMARY KEY(user_id, message_id)
-        );
-        CREATE TABLE IF NOT EXISTS reels(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            media_path TEXT NOT NULL,
-            media_type TEXT NOT NULL,
-            caption TEXT DEFAULT '',
-            created_at REAL NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS reel_views(
-            reel_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            viewed_at REAL NOT NULL,
-            PRIMARY KEY(reel_id, user_id)
-        );
-        CREATE TABLE IF NOT EXISTS reel_reactions(
-            reel_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            emoji TEXT NOT NULL,
-            PRIMARY KEY(reel_id, user_id)
-        );
-        CREATE TABLE IF NOT EXISTS reel_comments(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            reel_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            content TEXT NOT NULL,
-            parent_id INTEGER,
-            created_at REAL NOT NULL
-        );
-    """)
-    conn.commit()
-    conn.close()
-
-# Initialisation automatique des tables au démarrage (requis pour Render / WSGI)
-with app.app_context():
-    init_db()
-
-# ===== HELPERS =====
-
-def dm_chat_id(uid1, uid2):
-    a, b = sorted([int(uid1), int(uid2)])
-    return f"{a}_{b}"
-
-def hash_pw(pw):
-    return bcrypt.hashpw(pw.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-
-def verify_pw(pw, stored):
-    return bcrypt.checkpw(pw.encode('utf-8'), stored.encode('utf-8'))
-
-def new_token():
-    return secrets.token_urlsafe(32)
-
-def allowed_file(filename):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_MEDIA
-
-def user_public(u):
-    return {
-        "id": u["id"],
-        "username": u["username"],
-        "email": u["email"],
-        "avatar": u["avatar"],
-        "status": u["status"]
-    }
-
-def preview_text(msg):
-    if msg["msg_type"] == "text":
-        t = msg["content"]
-        return (t[:42] + "…") if len(t) > 42 else t
-    if msg["msg_type"] == "call":
-        parts = (msg["content"] or "audio:missed:0").split(":")
-        ctype = parts[0] if len(parts) > 0 else "audio"
-        status = parts[1] if len(parts) > 1 else "missed"
-        icon = "🎥" if ctype == "video" else "📞"
-        if status == "completed":
-            return f"{icon} {'Video' if ctype=='video' else 'Voice'} call"
-        if status == "declined":
-            return f"{icon} Call declined"
-        return f"{icon} Missed call"
-    return {"image": "📷 Photo", "video": "🎬 Video", "voice": "🎤 Voice message"}.get(
-        msg["msg_type"], "Message"
-    )
-
-def serialize_message(conn, r):
-    reactions = conn.execute(
-        "SELECT user_id, emoji FROM reactions WHERE message_id=?", (r["id"],)
-    ).fetchall()
-    sender = conn.execute(
-        "SELECT username, avatar FROM users WHERE id=?", (r["sender_id"],)
-    ).fetchone()
-
-    reply_to = None
-    if r["reply_to_id"]:
-        orig = conn.execute("SELECT * FROM messages WHERE id=?", (r["reply_to_id"],)).fetchone()
-        if orig:
-            orig_sender = conn.execute("SELECT username FROM users WHERE id=?", (orig["sender_id"],)).fetchone()
-            reply_to = {
-                "id": orig["id"],
-                "sender_name": orig_sender["username"] if orig_sender else "Unknown",
-                "preview": preview_text(orig) if not orig["deleted"] else "Message deleted",
-                "msg_type": orig["msg_type"],
-            }
-
-    forwarded_from_name = None
-    if r["forwarded_from_id"]:
-        orig_user = conn.execute("SELECT username FROM users WHERE id=?", (r["forwarded_from_id"],)).fetchone()
-        forwarded_from_name = orig_user["username"] if orig_user else "Unknown"
-
-    return {
-        "id": r["id"],
-        "chat_type": r["chat_type"],
-        "chat_id": r["chat_id"],
-        "sender_id": r["sender_id"],
-        "sender_name": sender["username"] if sender else "Unknown",
-        "sender_avatar": sender["avatar"] if sender else "",
-        "msg_type": r["msg_type"],
-        "content": "" if r["deleted"] else r["content"],
-        "media_path": "" if r["deleted"] else r["media_path"],
-        "timestamp": r["timestamp"],
-        "deleted": bool(r["deleted"]),
-        "edited": bool(r["edited"]),
-        "reactions": [{"user_id": x["user_id"], "emoji": x["emoji"]} for x in reactions],
-        "reply_to": reply_to,
-        "forwarded_from_name": forwarded_from_name,
-    }
-
-def hidden_ids_for(db, uid):
-    rows = db.execute("SELECT message_id FROM hidden_messages WHERE user_id=?", (uid,)).fetchall()
-    return {r["message_id"] for r in rows}
-
-def touch_read_state(db, uid, chat_type, chat_id, last_id):
-    db.execute(
-        "INSERT INTO read_state(user_id, chat_type, chat_id, last_read_id) VALUES (?,?,?,?) "
-        "ON CONFLICT(user_id, chat_type, chat_id) DO UPDATE SET last_read_id=MAX(last_read_id, excluded.last_read_id)",
-        (uid, chat_type, chat_id, last_id),
-    )
-    db.commit()
-
-def rooms_for(chat_type, chat_id):
-    if chat_type == "dm":
-        a, b = chat_id.split("_")
-        return [f"user:{a}", f"user:{b}"]
-    return [f"group:{chat_id}"]
-
-def generate_invite_link(token):
-    base_url = PUBLIC_BASE_URL.rstrip('/')
-    return f"{base_url}/?join={token}"
-
-# ===== AUTH DECORATOR =====
-
-def auth_required(f):
+# ===== AUTHENTICATION DECORATOR =====
+def token_required(f):
     @wraps(f)
-    def wrapper(*args, **kwargs):
-        token = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    def decorated(*args, **kwargs):
+        token = request.headers.get('Authorization')
         if not token:
-            return jsonify({"error": "Missing session token"}), 401
-        db = get_db()
-        user = db.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
-        if not user:
-            return jsonify({"error": "Invalid or expired session"}), 401
-        g.user = user
+            return jsonify({'error': 'Token required'}), 401
+        if token.startswith('Bearer '):
+            token = token[7:]
+        try:
+            data = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+            user_id = data['user_id']
+            if user_id not in DB['users']:
+                return jsonify({'error': 'Invalid token'}), 401
+            request.user_id = user_id
+            request.user = DB['users'][user_id]
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Invalid token'}), 401
         return f(*args, **kwargs)
-    return wrapper
+    return decorated
 
-# ===== AUTH ROUTES =====
+# ===== HELPER FUNCTIONS =====
+def generate_id():
+    return str(int(time.time() * 1000)) + '_' + uuid.uuid4().hex[:8]
 
-@app.route("/api/register", methods=["POST"])
-def register():
-    try:
-        data = request.get_json(silent=True) or request.form or {}
-        email = (data.get("email") or "").strip().lower()
-        username = (data.get("username") or "").strip()
-        password = data.get("password") or ""
+def hash_password(password):
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
 
-        if not email or "@" not in email:
-            return jsonify({"error": "Please provide a valid email address"}), 400
-        if not username:
-            return jsonify({"error": "Username is required"}), 400
-        if len(password) < 4:
-            return jsonify({"error": "Password must be at least 4 characters"}), 400
+def verify_password(password, password_hash):
+    return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
 
-        db = get_db()
-        existing = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
-        if existing:
-            return jsonify({"error": "This email has already been used to create an account"}), 409
+def generate_token(user_id):
+    return jwt.encode({'user_id': user_id, 'exp': datetime.datetime.utcnow() + datetime.timedelta(days=7)}, JWT_SECRET, algorithm='HS256')
 
-        token = new_token()
-        db.execute(
-            "INSERT INTO users(email, username, password_hash, token, status, created_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (email, username, hash_pw(password), token, "online", time.time()),
-        )
-        db.commit()
-        user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-        return jsonify({"token": token, "user": user_public(user)})
-    except Exception as e:
-        return jsonify({"error": f"Server error during registration: {str(e)}"}), 500
+def get_conversation_key(chat_type, chat_id):
+    return f"{chat_type}:{chat_id}"
 
-@app.route("/api/login", methods=["POST"])
-def login():
-    data = request.get_json(silent=True) or request.form or {}
-    email = (data.get("email") or "").strip().lower()
-    password = data.get("password") or ""
-    db = get_db()
-    user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-    if not user or not verify_pw(password, user["password_hash"]):
-        return jsonify({"error": "Invalid email or password"}), 401
-    token = new_token()
-    db.execute("UPDATE users SET token=?, status='online' WHERE id=?", (token, user["id"]))
-    db.commit()
-    user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
-    return jsonify({"token": token, "user": user_public(user)})
+def get_or_create_conversation(user_id, chat_type, chat_id, name=None, avatar=None):
+    key = get_conversation_key(chat_type, chat_id)
+    if key in DB['conversations']:
+        return DB['conversations'][key]
+    
+    conv = {
+        'id': chat_id,
+        'type': chat_type,
+        'name': name or 'Unknown',
+        'avatar': avatar or '',
+        'last_message': '',
+        'last_timestamp': time.time(),
+        'unread': 0
+    }
+    DB['conversations'][key] = conv
+    return conv
 
-@app.route("/api/logout", methods=["POST"])
-@auth_required
-def logout():
-    db = get_db()
-    db.execute("UPDATE users SET token=NULL, status='offline' WHERE id=?", (g.user["id"],))
-    db.commit()
-    return jsonify({"ok": True})
+def update_conversation(user_id, chat_type, chat_id, message):
+    key = get_conversation_key(chat_type, chat_id)
+    if key in DB['conversations']:
+        conv = DB['conversations'][key]
+        conv['last_message'] = message.get('preview', message.get('content', ''))
+        conv['last_timestamp'] = message.get('timestamp', time.time())
+        if message.get('sender_id') != user_id:
+            conv['unread'] = conv.get('unread', 0) + 1
+    else:
+        # Create new conversation
+        if chat_type == 'dm':
+            other_user = DB['users'].get(chat_id)
+            name = other_user['username'] if other_user else 'Unknown'
+            avatar = other_user.get('avatar', '') if other_user else ''
+        else:
+            group = DB['groups'].get(chat_id)
+            name = group['name'] if group else 'Unknown'
+            avatar = group.get('avatar', '') if group else ''
+        conv = {
+            'id': chat_id,
+            'type': chat_type,
+            'name': name,
+            'avatar': avatar,
+            'last_message': message.get('preview', message.get('content', '')),
+            'last_timestamp': message.get('timestamp', time.time()),
+            'unread': 1 if message.get('sender_id') != user_id else 0
+        }
+        DB['conversations'][key] = conv
 
-@app.route("/api/account", methods=["DELETE"])
-@auth_required
-def delete_account():
-    data = request.get_json(silent=True) or {}
-    password = data.get("password") or ""
-    if not verify_pw(password, g.user["password_hash"]):
-        return jsonify({"error": "Incorrect password"}), 403
+def format_user(user):
+    return {
+        'id': user['id'],
+        'username': user['username'],
+        'email': user.get('email', ''),
+        'avatar': user.get('avatar', ''),
+        'status': user.get('status', 'offline'),
+        'created_at': user.get('created_at', time.time())
+    }
 
-    uid = g.user["id"]
-    db = get_db()
-    reel_files = db.execute("SELECT media_path FROM reels WHERE user_id=?", (uid,)).fetchall()
+def format_message(msg):
+    return {
+        'id': msg['id'],
+        'chat_type': msg['chat_type'],
+        'chat_id': msg['chat_id'],
+        'sender_id': msg['sender_id'],
+        'sender_name': msg.get('sender_name', ''),
+        'sender_avatar': msg.get('sender_avatar', ''),
+        'msg_type': msg.get('msg_type', 'text'),
+        'content': msg.get('content', ''),
+        'media_path': msg.get('media_path', ''),
+        'timestamp': msg.get('timestamp', time.time()),
+        'deleted': msg.get('deleted', False),
+        'edited': msg.get('edited', False),
+        'reactions': msg.get('reactions', []),
+        'reply_to': msg.get('reply_to'),
+        'forwarded_from': msg.get('forwarded_from'),
+        'client_id': msg.get('client_id'),
+        'preview': msg.get('preview', msg.get('content', '')[:50])
+    }
 
-    try:
-        db.execute("DELETE FROM messages WHERE sender_id=?", (uid,))
-        db.execute("DELETE FROM reactions WHERE user_id=?", (uid,))
-        db.execute("DELETE FROM reel_comments WHERE user_id=?", (uid,))
-        db.execute("DELETE FROM reel_reactions WHERE user_id=?", (uid,))
-        db.execute("DELETE FROM reel_views WHERE user_id=?", (uid,))
-        db.execute("DELETE FROM reels WHERE user_id=?", (uid,))
-        db.execute("DELETE FROM group_members WHERE user_id=?", (uid,))
-        db.execute("DELETE FROM blocks WHERE blocker_id=? OR blocked_id=?", (uid, uid))
-        db.execute("DELETE FROM read_state WHERE user_id=?", (uid,))
-        db.execute("DELETE FROM hidden_messages WHERE user_id=?", (uid,))
-        db.execute("DELETE FROM users WHERE id=?", (uid,))
-        db.commit()
-    except Exception:
-        db.rollback()
-        return jsonify({"error": "Account deletion failed"}), 500
+# ===== ROUTES =====
 
-    for row in reel_files:
-        try:
-            path = row["media_path"].replace("/uploads/", "", 1)
-            full = os.path.join(UPLOAD_DIR, path)
-            if os.path.isfile(full):
-                os.remove(full)
-        except OSError:
-            pass
-
-    socketio.emit("account_deleted", {}, room=f"user:{uid}")
-    return jsonify({"ok": True})
-
-@app.route("/api/config", methods=["GET"])
+@app.route('/api/config', methods=['GET'])
 def get_config():
-    return jsonify({"public_base_url": PUBLIC_BASE_URL})
+    return jsonify({
+        'public_base_url': PUBLIC_BASE_URL,
+        'version': '2.0.0'
+    })
 
-@app.route("/api/me", methods=["GET"])
-@auth_required
-def me():
-    return jsonify({"user": user_public(g.user)})
+@app.route('/api/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    username = data.get('username', '').strip()
+    email = data.get('email', '').strip().lower()
+    password = data.get('password', '')
+    
+    if not username or not email or not password:
+        return jsonify({'error': 'All fields are required'}), 400
+    
+    if len(password) < 4:
+        return jsonify({'error': 'Password must be at least 4 characters'}), 400
+    
+    # Check if username or email already exists
+    for user in DB['users'].values():
+        if user['username'].lower() == username.lower():
+            return jsonify({'error': 'Username already taken'}), 400
+        if user['email'].lower() == email:
+            return jsonify({'error': 'Email already registered'}), 400
+    
+    user_id = generate_id()
+    user = {
+        'id': user_id,
+        'username': username,
+        'email': email,
+        'password_hash': hash_password(password),
+        'avatar': '',
+        'status': 'offline',
+        'blocked_ids': [],
+        'created_at': time.time()
+    }
+    DB['users'][user_id] = user
+    
+    token = generate_token(user_id)
+    DB['sessions'][token] = user_id
+    
+    return jsonify({
+        'token': token,
+        'user': format_user(user)
+    })
 
-@app.route("/api/profile", methods=["POST"])
-@auth_required
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    email = data.get('email', '').strip().lower()
+    password = data.get('password', '')
+    
+    # Find user by email
+    user = None
+    for u in DB['users'].values():
+        if u['email'].lower() == email:
+            user = u
+            break
+    
+    if not user:
+        return jsonify({'error': 'Invalid email or password'}), 401
+    
+    if not verify_password(password, user['password_hash']):
+        return jsonify({'error': 'Invalid email or password'}), 401
+    
+    token = generate_token(user['id'])
+    DB['sessions'][token] = user['id']
+    
+    # Update status
+    user['status'] = 'online'
+    
+    return jsonify({
+        'token': token,
+        'user': format_user(user)
+    })
+
+@app.route('/api/logout', methods=['POST'])
+@token_required
+def logout():
+    token = request.headers.get('Authorization', '').replace('Bearer ', '')
+    if token in DB['sessions']:
+        del DB['sessions'][token]
+    user = DB['users'].get(request.user_id)
+    if user:
+        user['status'] = 'offline'
+    return jsonify({'success': True})
+
+@app.route('/api/me', methods=['GET'])
+@token_required
+def get_me():
+    return jsonify({'user': format_user(request.user)})
+
+@app.route('/api/profile', methods=['POST'])
+@token_required
 def update_profile():
-    username = request.form.get("username")
-    avatar_file = request.files.get("avatar")
-    db = get_db()
-    if username:
-        db.execute("UPDATE users SET username=? WHERE id=?", (username.strip(), g.user["id"]))
-    if avatar_file and avatar_file.filename and allowed_file(avatar_file.filename):
-        ext = avatar_file.filename.rsplit(".", 1)[1].lower()
-        fname = f"{g.user['id']}_{uuid.uuid4().hex}.{ext}"
-        avatar_file.save(os.path.join(AVATAR_DIR, fname))
-        db.execute("UPDATE users SET avatar=? WHERE id=?",
-                   (f"/uploads/avatars/{fname}", g.user["id"]))
-    db.commit()
-    user = db.execute("SELECT * FROM users WHERE id=?", (g.user["id"],)).fetchone()
-    return jsonify({"user": user_public(user)})
+    user = request.user
+    if request.files and 'avatar' in request.files:
+        file = request.files['avatar']
+        if file and allowed_file(file.filename):
+            ext = file.filename.rsplit('.', 1)[1].lower()
+            filename = f"avatar_{user['id']}.{ext}"
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(filepath)
+            user['avatar'] = f"/uploads/{filename}"
+            return jsonify({'user': format_user(user)})
+    
+    data = request.get_json() or {}
+    if 'username' in data:
+        username = data['username'].strip()
+        if username:
+            # Check if username is taken
+            for u in DB['users'].values():
+                if u['id'] != user['id'] and u['username'].lower() == username.lower():
+                    return jsonify({'error': 'Username already taken'}), 400
+            user['username'] = username
+    
+    return jsonify({'user': format_user(user)})
 
-# ===== CONVERSATIONS =====
-
-@app.route("/api/conversations", methods=["GET"])
-@auth_required
-def conversations():
-    db = get_db()
-    uid = g.user["id"]
-    convos = []
-
-    dm_chat_ids = db.execute("SELECT DISTINCT chat_id FROM messages WHERE chat_type='dm'").fetchall()
-    for row in dm_chat_ids:
-        cid = row["chat_id"]
-        try:
-            a, b = (int(x) for x in cid.split("_"))
-        except ValueError:
-            continue
-        if uid not in (a, b):
-            continue
-        partner_id = b if a == uid else a
-        partner = db.execute("SELECT * FROM users WHERE id=?", (partner_id,)).fetchone()
-        if not partner:
-            continue
-        last_msg = db.execute(
-            "SELECT * FROM messages WHERE chat_type='dm' AND chat_id=? ORDER BY id DESC LIMIT 1", (cid,)
-        ).fetchone()
-        if not last_msg:
-            continue
-        last_read = db.execute(
-            "SELECT last_read_id FROM read_state WHERE user_id=? AND chat_type='dm' AND chat_id=?", (uid, cid)
-        ).fetchone()
-        last_read_id = last_read["last_read_id"] if last_read else 0
-        unread = db.execute(
-            "SELECT COUNT(*) c FROM messages WHERE chat_type='dm' AND chat_id=? AND sender_id!=? AND id>? AND deleted=0",
-            (cid, uid, last_read_id)
-        ).fetchone()["c"]
-        convos.append({
-            "type": "dm",
-            "id": partner_id,
-            "name": partner["username"],
-            "avatar": partner["avatar"],
-            "status": partner["status"],
-            "last_preview": "Message deleted" if last_msg["deleted"] else preview_text(last_msg),
-            "last_timestamp": last_msg["timestamp"],
-            "last_is_mine": last_msg["sender_id"] == uid,
-            "unread": unread,
-        })
-
-    group_rows = db.execute(
-        """SELECT g.*, m.role FROM groups g JOIN group_members m ON m.group_id = g.id
-           WHERE m.user_id=?""", (uid,)
-    ).fetchall()
-    for grp in group_rows:
-        last_msg = db.execute(
-            "SELECT * FROM messages WHERE chat_type='group' AND chat_id=? ORDER BY id DESC LIMIT 1",
-            (str(grp["id"]),)
-        ).fetchone()
-        preview, ts, is_mine = "No messages yet", grp["created_at"], False
-        if last_msg:
-            preview = "Message deleted" if last_msg["deleted"] else preview_text(last_msg)
-            ts = last_msg["timestamp"]
-            is_mine = last_msg["sender_id"] == uid
-        last_read = db.execute(
-            "SELECT last_read_id FROM read_state WHERE user_id=? AND chat_type='group' AND chat_id=?",
-            (uid, str(grp["id"]))
-        ).fetchone()
-        last_read_id = last_read["last_read_id"] if last_read else 0
-        unread = db.execute(
-            "SELECT COUNT(*) c FROM messages WHERE chat_type='group' AND chat_id=? AND sender_id!=? AND id>? AND deleted=0",
-            (str(grp["id"]), uid, last_read_id)
-        ).fetchone()["c"]
-        convos.append({
-            "type": "group",
-            "id": grp["id"],
-            "name": grp["name"],
-            "avatar": grp["avatar"],
-            "status": "",
-            "last_preview": preview,
-            "last_timestamp": ts,
-            "last_is_mine": is_mine,
-            "role": grp["role"],
-            "invite_token": grp["invite_token"],
-            "has_password": bool(grp["password_hash"]),
-            "unread": unread,
-            "invite_link": generate_invite_link(grp["invite_token"])
-        })
-
-    convos.sort(key=lambda c: c["last_timestamp"], reverse=True)
-    return jsonify({"conversations": convos})
-
-@app.route("/api/unread_total", methods=["GET"])
-@auth_required
-def unread_total():
-    r = conversations()
-    data = r.get_json()
-    total = sum(c["unread"] for c in data["conversations"])
-    return jsonify({"total": total})
-
-@app.route("/api/users/search", methods=["GET"])
-@auth_required
+@app.route('/api/users/search', methods=['GET'])
+@token_required
 def search_users():
-    q = (request.args.get("q") or "").strip()
-    db = get_db()
-    if q:
-        rows = db.execute(
-            "SELECT * FROM users WHERE (username LIKE ? OR email LIKE ?) AND id != ? "
-            "ORDER BY username LIMIT 30",
-            (f"%{q}%", f"%{q}%", g.user["id"]),
-        ).fetchall()
-    else:
-        rows = db.execute(
-            "SELECT * FROM users WHERE id != ? ORDER BY username LIMIT 50", (g.user["id"],)
-        ).fetchall()
-    blocked = {
-        r["blocked_id"]
-        for r in db.execute("SELECT blocked_id FROM blocks WHERE blocker_id=?", (g.user["id"],))
-    }
-    return jsonify({"users": [user_public(u) for u in rows if u["id"] not in blocked]})
+    q = request.args.get('q', '').strip().lower()
+    users = []
+    for u in DB['users'].values():
+        if u['id'] == request.user_id:
+            continue
+        if q and q not in u['username'].lower():
+            continue
+        users.append(format_user(u))
+    return jsonify({'users': users})
 
-@app.route("/api/block", methods=["POST"])
-@auth_required
-def block_user():
-    target_id = (request.get_json(silent=True) or {}).get("user_id")
-    db = get_db()
-    db.execute("INSERT OR IGNORE INTO blocks(blocker_id, blocked_id) VALUES (?,?)",
-               (g.user["id"], target_id))
-    db.commit()
-    return jsonify({"ok": True})
+@app.route('/api/conversations', methods=['GET'])
+@token_required
+def get_conversations():
+    user_id = request.user_id
+    convs = []
+    for key, conv in DB['conversations'].items():
+        if key.startswith('dm:') and conv['id'] != user_id:
+            # Check if blocked
+            other_id = conv['id']
+            if other_id in request.user.get('blocked_ids', []):
+                continue
+            other = DB['users'].get(other_id)
+            if other and other_id in other.get('blocked_ids', []):
+                continue
+        convs.append({
+            'id': conv['id'],
+            'type': conv['type'],
+            'name': conv['name'],
+            'avatar': conv.get('avatar', ''),
+            'last_preview': conv.get('last_message', ''),
+            'last_timestamp': conv.get('last_timestamp', time.time()),
+            'last_is_mine': False,  # Simplified
+            'unread': conv.get('unread', 0),
+            'status': 'online' if conv['type'] == 'dm' and DB['users'].get(conv['id'], {}).get('status') == 'online' else 'offline'
+        })
+    # Sort by last_timestamp
+    convs.sort(key=lambda x: x.get('last_timestamp', 0), reverse=True)
+    return jsonify({'conversations': convs})
 
-@app.route("/api/unblock", methods=["POST"])
-@auth_required
-def unblock_user():
-    target_id = (request.get_json(silent=True) or {}).get("user_id")
-    db = get_db()
-    db.execute("DELETE FROM blocks WHERE blocker_id=? AND blocked_id=?", (g.user["id"], target_id))
-    db.commit()
-    return jsonify({"ok": True})
+@app.route('/api/unread_total', methods=['GET'])
+@token_required
+def get_unread_total():
+    total = 0
+    for key, conv in DB['conversations'].items():
+        total += conv.get('unread', 0)
+    return jsonify({'total': total})
 
-@app.route("/api/block/status/<int:other_id>", methods=["GET"])
-@auth_required
-def block_status(other_id):
-    db = get_db()
-    i_blocked = db.execute(
-        "SELECT 1 FROM blocks WHERE blocker_id=? AND blocked_id=?", (g.user["id"], other_id)
-    ).fetchone() is not None
-    they_blocked = db.execute(
-        "SELECT 1 FROM blocks WHERE blocker_id=? AND blocked_id=?", (other_id, g.user["id"])
-    ).fetchone() is not None
-    return jsonify({"i_blocked": i_blocked, "they_blocked": they_blocked})
+@app.route('/api/messages/dm/<user_id>', methods=['GET'])
+@token_required
+def get_dm_messages(user_id):
+    # Check if blocked
+    if user_id in request.user.get('blocked_ids', []):
+        return jsonify({'error': 'Blocked'}), 403
+    other = DB['users'].get(user_id)
+    if other and user_id in other.get('blocked_ids', []):
+        return jsonify({'error': 'Blocked'}), 403
+    
+    messages = []
+    for msg in DB['messages'].values():
+        if msg['chat_type'] == 'dm' and (
+            (msg['sender_id'] == request.user_id and msg['chat_id'] == user_id) or
+            (msg['sender_id'] == user_id and msg['chat_id'] == request.user_id)
+        ):
+            if not msg.get('deleted', False):
+                messages.append(format_message(msg))
+    
+    messages.sort(key=lambda x: x['timestamp'])
+    return jsonify({'messages': messages})
 
-@app.route("/api/blocked", methods=["GET"])
-@auth_required
-def list_blocked():
-    db = get_db()
-    rows = db.execute(
-        "SELECT u.* FROM users u JOIN blocks b ON b.blocked_id=u.id WHERE b.blocker_id=?",
-        (g.user["id"],),
-    ).fetchall()
-    return jsonify({"users": [user_public(u) for u in rows]})
+@app.route('/api/messages/group/<group_id>', methods=['GET'])
+@token_required
+def get_group_messages(group_id):
+    group = DB['groups'].get(group_id)
+    if not group:
+        return jsonify({'error': 'Group not found'}), 404
+    
+    if request.user_id not in group.get('members', []):
+        return jsonify({'error': 'Not a member'}), 403
+    
+    messages = []
+    for msg in DB['messages'].values():
+        if msg['chat_type'] == 'group' and msg['chat_id'] == group_id:
+            if not msg.get('deleted', False):
+                messages.append(format_message(msg))
+    
+    messages.sort(key=lambda x: x['timestamp'])
+    return jsonify({'messages': messages})
 
-# ===== GROUPS =====
+@app.route('/api/messages/<message_id>/hide', methods=['POST'])
+@token_required
+def hide_message(message_id):
+    msg = DB['messages'].get(message_id)
+    if not msg:
+        return jsonify({'error': 'Message not found'}), 404
+    # Delete for me (soft delete)
+    msg['deleted'] = True
+    return jsonify({'success': True})
 
-@app.route("/api/groups", methods=["POST"])
-@auth_required
+@app.route('/api/upload', methods=['POST'])
+@token_required
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+    
+    file = request.files['file']
+    if not file:
+        return jsonify({'error': 'No file provided'}), 400
+    
+    # Determine file type
+    filename = secure_filename(file.filename)
+    ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+    
+    if ext not in ALLOWED_EXTENSIONS:
+        return jsonify({'error': 'File type not allowed'}), 400
+    
+    # Generate unique filename
+    new_filename = f"{uuid.uuid4().hex}.{ext}"
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], new_filename)
+    file.save(filepath)
+    
+    return jsonify({'path': f"/uploads/{new_filename}"})
+
+@app.route('/uploads/<filename>')
+def serve_upload(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+# ===== GROUP ROUTES =====
+
+@app.route('/api/groups', methods=['POST'])
+@token_required
 def create_group():
-    data = request.get_json(silent=True) or {}
-    name = (data.get("name") or "").strip()
-    password = data.get("password") or ""
+    data = request.get_json()
+    name = data.get('name', '').strip()
+    password = data.get('password', '')
+    
     if not name:
-        return jsonify({"error": "Group name is required"}), 400
-    db = get_db()
-    token = secrets.token_urlsafe(12)
-    pw_hash = hash_pw(password) if password else ""
-    cur = db.execute(
-        "INSERT INTO groups(name, creator_id, invite_token, password_hash, created_at) "
-        "VALUES (?,?,?,?,?)",
-        (name, g.user["id"], token, pw_hash, time.time()),
-    )
-    gid = cur.lastrowid
-    db.execute(
-        "INSERT INTO group_members(group_id, user_id, role, joined_at) VALUES (?,?,?,?)",
-        (gid, g.user["id"], "admin", time.time()),
-    )
-    db.commit()
+        return jsonify({'error': 'Group name required'}), 400
     
-    return jsonify({
-        "group": {
-            "id": gid,
-            "name": name,
-            "invite_token": token,
-            "has_password": bool(password),
-            "role": "admin",
-            "invite_link": generate_invite_link(token)
-        }
-    })
-
-@app.route("/api/groups/mine", methods=["GET"])
-@auth_required
-def my_groups():
-    db = get_db()
-    rows = db.execute(
-        """SELECT g.*, m.role FROM groups g
-           JOIN group_members m ON m.group_id = g.id
-           WHERE m.user_id=?""",
-        (g.user["id"],),
-    ).fetchall()
-    return jsonify({
-        "groups": [
-            {
-                "id": r["id"],
-                "name": r["name"],
-                "avatar": r["avatar"],
-                "invite_token": r["invite_token"],
-                "role": r["role"],
-                "has_password": bool(r["password_hash"]),
-                "invite_link": generate_invite_link(r["invite_token"])
-            }
-            for r in rows
-        ]
-    })
-
-@app.route("/api/groups/join/<token>", methods=["POST"])
-@auth_required
-def join_group(token):
-    password = (request.get_json(silent=True) or {}).get("password", "")
-    db = get_db()
-    grp = db.execute("SELECT * FROM groups WHERE invite_token=?", (token,)).fetchone()
-    if not grp:
-        return jsonify({"error": "Invalid invite link"}), 404
-    if grp["password_hash"] and not verify_pw(password, grp["password_hash"]):
-        return jsonify({"error": "Incorrect group password"}), 403
-    db.execute(
-        "INSERT OR IGNORE INTO group_members(group_id, user_id, role, joined_at) VALUES (?,?,?,?)",
-        (grp["id"], g.user["id"], "member", time.time()),
-    )
-    db.commit()
-    return jsonify({
-        "group": {
-            "id": grp["id"],
-            "name": grp["name"],
-            "role": "member",
-            "invite_link": generate_invite_link(grp["invite_token"])
-        }
-    })
-
-@app.route("/api/groups/<int:gid>/members", methods=["GET"])
-@auth_required
-def group_members(gid):
-    db = get_db()
-    member = db.execute(
-        "SELECT * FROM group_members WHERE group_id=? AND user_id=?", (gid, g.user["id"])
-    ).fetchone()
-    if not member:
-        return jsonify({"error": "You are not a member of this group"}), 403
-    rows = db.execute(
-        """SELECT u.*, m.role FROM users u
-           JOIN group_members m ON m.user_id = u.id
-           WHERE m.group_id=?""",
-        (gid,),
-    ).fetchall()
-    return jsonify({"members": [{**user_public(r), "role": r["role"]} for r in rows]})
-
-@app.route("/api/groups/<int:gid>/avatar", methods=["POST"])
-@auth_required
-def group_avatar(gid):
-    db = get_db()
-    member = db.execute(
-        "SELECT role FROM group_members WHERE group_id=? AND user_id=?", (gid, g.user["id"])
-    ).fetchone()
-    if not member or member["role"] != "admin":
-        return jsonify({"error": "Only the group admin can change this"}), 403
-    avatar_file = request.files.get("avatar")
-    if not avatar_file or not allowed_file(avatar_file.filename):
-        return jsonify({"error": "Invalid image"}), 400
-    ext = avatar_file.filename.rsplit(".", 1)[1].lower()
-    fname = f"g{gid}_{uuid.uuid4().hex}.{ext}"
-    avatar_file.save(os.path.join(AVATAR_DIR, fname))
-    db.execute("UPDATE groups SET avatar=? WHERE id=?", (f"/uploads/avatars/{fname}", gid))
-    db.commit()
-    return jsonify({"avatar": f"/uploads/avatars/{fname}"})
-
-# ===== MEDIA UPLOAD =====
-
-@app.route("/api/upload", methods=["POST"])
-@auth_required
-def upload_media():
-    f = request.files.get("file")
-    if not f or not f.filename or not allowed_file(f.filename):
-        return jsonify({"error": "Invalid or missing file"}), 400
-    ext = f.filename.rsplit(".", 1)[1].lower()
-    fname = f"{uuid.uuid4().hex}.{ext}"
-    f.save(os.path.join(MEDIA_DIR, fname))
-    return jsonify({"path": f"/uploads/media/{fname}"})
-
-@app.route("/uploads/<path:subpath>")
-def serve_upload(subpath):
-    return send_from_directory(UPLOAD_DIR, subpath)
-
-# ===== MESSAGES HISTORY =====
-
-@app.route("/api/messages/dm/<int:other_id>", methods=["GET"])
-@auth_required
-def dm_history(other_id):
-    db = get_db()
-    chat_id = dm_chat_id(g.user["id"], other_id)
-    rows = db.execute(
-        "SELECT * FROM messages WHERE chat_type='dm' AND chat_id=? ORDER BY id ASC LIMIT 300",
-        (chat_id,),
-    ).fetchall()
-    if rows:
-        touch_read_state(db, g.user["id"], "dm", chat_id, rows[-1]["id"])
-    hidden = hidden_ids_for(db, g.user["id"])
-    return jsonify({"messages": [serialize_message(db, r) for r in rows if r["id"] not in hidden]})
-
-@app.route("/api/messages/group/<int:gid>", methods=["GET"])
-@auth_required
-def group_history(gid):
-    db = get_db()
-    member = db.execute(
-        "SELECT 1 FROM group_members WHERE group_id=? AND user_id=?", (gid, g.user["id"])
-    ).fetchone()
-    if not member:
-        return jsonify({"error": "You are not a member of this group"}), 403
-    rows = db.execute(
-        "SELECT * FROM messages WHERE chat_type='group' AND chat_id=? ORDER BY id ASC LIMIT 300",
-        (str(gid),),
-    ).fetchall()
-    if rows:
-        touch_read_state(db, g.user["id"], "group", str(gid), rows[-1]["id"])
-    hidden = hidden_ids_for(db, g.user["id"])
-    return jsonify({"messages": [serialize_message(db, r) for r in rows if r["id"] not in hidden]})
-
-@app.route("/api/messages/<int:msg_id>/hide", methods=["POST"])
-@auth_required
-def hide_message(msg_id):
-    db = get_db()
-    db.execute(
-        "INSERT OR IGNORE INTO hidden_messages(user_id, message_id) VALUES (?,?)",
-        (g.user["id"], msg_id),
-    )
-    db.commit()
-    return jsonify({"ok": True})
-
-# ===== REELS =====
-
-def serialize_reel(db, r, uid):
-    author = db.execute("SELECT username, avatar FROM users WHERE id=?", (r["user_id"],)).fetchone()
-    view_count = db.execute("SELECT COUNT(*) c FROM reel_views WHERE reel_id=?", (r["id"],)).fetchone()["c"]
-    reactions = db.execute("SELECT user_id, emoji FROM reel_reactions WHERE reel_id=?", (r["id"],)).fetchall()
-    comment_count = db.execute("SELECT COUNT(*) c FROM reel_comments WHERE reel_id=?", (r["id"],)).fetchone()["c"]
-    my_reaction = next((x["emoji"] for x in reactions if x["user_id"] == uid), None)
-    return {
-        "id": r["id"],
-        "author_id": r["user_id"],
-        "author_name": author["username"] if author else "Unknown",
-        "author_avatar": author["avatar"] if author else "",
-        "media_path": r["media_path"],
-        "media_type": r["media_type"],
-        "caption": r["caption"],
-        "created_at": r["created_at"],
-        "view_count": view_count,
-        "comment_count": comment_count,
-        "reaction_counts": _count_by_emoji(reactions),
-        "my_reaction": my_reaction,
-        "is_mine": r["user_id"] == uid,
+    group_id = generate_id()
+    group = {
+        'id': group_id,
+        'name': name,
+        'avatar': '',
+        'admin_id': request.user_id,
+        'members': [request.user_id],
+        'invite_token': uuid.uuid4().hex[:12],
+        'has_password': bool(password),
+        'password_hash': hash_password(password) if password else '',
+        'created_at': time.time()
     }
+    DB['groups'][group_id] = group
+    
+    # Create conversation
+    get_or_create_conversation(request.user_id, 'group', group_id, name, '')
+    
+    return jsonify({'group': group})
 
-def _count_by_emoji(reactions):
-    counts = {}
-    for x in reactions:
-        counts[x["emoji"]] = counts.get(x["emoji"], 0) + 1
-    return counts
+@app.route('/api/groups/mine', methods=['GET'])
+@token_required
+def get_my_groups():
+    groups = []
+    for g in DB['groups'].values():
+        if request.user_id in g.get('members', []):
+            groups.append({
+                'id': g['id'],
+                'name': g['name'],
+                'avatar': g.get('avatar', ''),
+                'role': 'admin' if g.get('admin_id') == request.user_id else 'member',
+                'has_password': g.get('has_password', False),
+                'invite_token': g.get('invite_token', ''),
+                'member_count': len(g.get('members', []))
+            })
+    return jsonify({'groups': groups})
 
-@app.route("/api/reels", methods=["POST"])
-@auth_required
+@app.route('/api/groups/<group_id>/members', methods=['GET'])
+@token_required
+def get_group_members(group_id):
+    group = DB['groups'].get(group_id)
+    if not group:
+        return jsonify({'error': 'Group not found'}), 404
+    
+    if request.user_id not in group.get('members', []):
+        return jsonify({'error': 'Not a member'}), 403
+    
+    members = []
+    for uid in group.get('members', []):
+        user = DB['users'].get(uid)
+        if user:
+            members.append({
+                'id': user['id'],
+                'username': user['username'],
+                'avatar': user.get('avatar', ''),
+                'role': 'admin' if uid == group.get('admin_id') else 'member'
+            })
+    return jsonify({'members': members})
+
+@app.route('/api/groups/<group_id>/avatar', methods=['POST'])
+@token_required
+def update_group_avatar(group_id):
+    group = DB['groups'].get(group_id)
+    if not group:
+        return jsonify({'error': 'Group not found'}), 404
+    
+    if group.get('admin_id') != request.user_id:
+        return jsonify({'error': 'Only admin can change avatar'}), 403
+    
+    if 'avatar' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+    
+    file = request.files['avatar']
+    if file and allowed_file(file.filename):
+        ext = file.filename.rsplit('.', 1)[1].lower()
+        filename = f"group_{group_id}.{ext}"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+        group['avatar'] = f"/uploads/{filename}"
+        return jsonify({'avatar': group['avatar']})
+    
+    return jsonify({'error': 'Invalid file'}), 400
+
+@app.route('/api/groups/join/<invite_token>', methods=['POST'])
+@token_required
+def join_group(invite_token):
+    group = None
+    for g in DB['groups'].values():
+        if g.get('invite_token') == invite_token:
+            group = g
+            break
+    
+    if not group:
+        return jsonify({'error': 'Invalid invite token'}), 404
+    
+    if request.user_id in group.get('members', []):
+        return jsonify({'error': 'Already a member'}), 400
+    
+    # Check password
+    if group.get('has_password'):
+        data = request.get_json() or {}
+        password = data.get('password', '')
+        if not verify_password(password, group.get('password_hash', '')):
+            return jsonify({'error': 'Incorrect password'}), 403
+    
+    group['members'].append(request.user_id)
+    
+    # Create conversation
+    get_or_create_conversation(request.user_id, 'group', group['id'], group['name'], group.get('avatar', ''))
+    
+    return jsonify({'success': True})
+
+# ===== BLOCK ROUTES =====
+
+@app.route('/api/block', methods=['POST'])
+@token_required
+def block_user():
+    data = request.get_json()
+    user_id = data.get('user_id')
+    if not user_id:
+        return jsonify({'error': 'User ID required'}), 400
+    
+    if user_id == request.user_id:
+        return jsonify({'error': 'Cannot block yourself'}), 400
+    
+    if user_id not in DB['users']:
+        return jsonify({'error': 'User not found'}), 404
+    
+    if user_id not in request.user.get('blocked_ids', []):
+        request.user['blocked_ids'].append(user_id)
+    
+    return jsonify({'success': True})
+
+@app.route('/api/unblock', methods=['POST'])
+@token_required
+def unblock_user():
+    data = request.get_json()
+    user_id = data.get('user_id')
+    if not user_id:
+        return jsonify({'error': 'User ID required'}), 400
+    
+    if user_id in request.user.get('blocked_ids', []):
+        request.user['blocked_ids'].remove(user_id)
+    
+    return jsonify({'success': True})
+
+@app.route('/api/blocked', methods=['GET'])
+@token_required
+def get_blocked():
+    users = []
+    for uid in request.user.get('blocked_ids', []):
+        user = DB['users'].get(uid)
+        if user:
+            users.append({'id': user['id'], 'username': user['username']})
+    return jsonify({'users': users})
+
+@app.route('/api/block/status/<user_id>', methods=['GET'])
+@token_required
+def get_block_status(user_id):
+    i_blocked = user_id in request.user.get('blocked_ids', [])
+    other = DB['users'].get(user_id)
+    they_blocked = other and user_id in other.get('blocked_ids', [])
+    return jsonify({'i_blocked': i_blocked, 'they_blocked': they_blocked})
+
+# ===== ACCOUNT ROUTES =====
+
+@app.route('/api/account', methods=['DELETE'])
+@token_required
+def delete_account():
+    data = request.get_json() or {}
+    password = data.get('password', '')
+    
+    if not verify_password(password, request.user['password_hash']):
+        return jsonify({'error': 'Incorrect password'}), 403
+    
+    user_id = request.user_id
+    
+    # Delete user
+    if user_id in DB['users']:
+        del DB['users'][user_id]
+    
+    # Delete sessions
+    for token, uid in list(DB['sessions'].items()):
+        if uid == user_id:
+            del DB['sessions'][token]
+    
+    # Delete messages (soft delete)
+    for msg in DB['messages'].values():
+        if msg['sender_id'] == user_id:
+            msg['deleted'] = True
+    
+    # Remove from groups
+    for group in list(DB['groups'].values()):
+        if user_id in group.get('members', []):
+            group['members'].remove(user_id)
+        if group.get('admin_id') == user_id:
+            # Transfer admin to first member or delete group
+            if group.get('members'):
+                group['admin_id'] = group['members'][0]
+            else:
+                del DB['groups'][group['id']]
+    
+    return jsonify({'success': True})
+
+# ===== REELS ROUTES =====
+
+@app.route('/api/reels', methods=['GET'])
+@token_required
+def get_reels():
+    return jsonify({'reels': DB['reels'][:50]})  # Limit to 50
+
+@app.route('/api/reels', methods=['POST'])
+@token_required
 def create_reel():
-    f = request.files.get("file")
-    caption = (request.form.get("caption") or "").strip()
-    if not f or not f.filename or not allowed_file(f.filename):
-        return jsonify({"error": "Please attach a photo or video"}), 400
-    ext = f.filename.rsplit(".", 1)[1].lower()
-    media_type = "video" if ext in {"mp4", "mov", "webm", "3gp"} else "image"
-    fname = f"reel_{uuid.uuid4().hex}.{ext}"
-    f.save(os.path.join(MEDIA_DIR, fname))
-    db = get_db()
-    cur = db.execute(
-        "INSERT INTO reels(user_id, media_path, media_type, caption, created_at) VALUES (?,?,?,?,?)",
-        (g.user["id"], f"/uploads/media/{fname}", media_type, caption, time.time()),
-    )
-    db.commit()
-    row = db.execute("SELECT * FROM reels WHERE id=?", (cur.lastrowid,)).fetchone()
-    return jsonify({"reel": serialize_reel(db, row, g.user["id"])})
-
-@app.route("/api/reels", methods=["GET"])
-@auth_required
-def list_reels():
-    db = get_db()
-    rows = db.execute("SELECT * FROM reels ORDER BY id DESC LIMIT 100").fetchall()
-    return jsonify({"reels": [serialize_reel(db, r, g.user["id"]) for r in rows]})
-
-@app.route("/api/reels/<int:rid>", methods=["DELETE"])
-@auth_required
-def delete_reel(rid):
-    db = get_db()
-    row = db.execute("SELECT * FROM reels WHERE id=?", (rid,)).fetchone()
-    if not row or row["user_id"] != g.user["id"]:
-        return jsonify({"error": "You can only delete your own reels"}), 403
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
     
-    try:
-        path = row["media_path"].replace("/uploads/", "", 1)
-        full = os.path.join(UPLOAD_DIR, path)
-        if os.path.isfile(full):
-            os.remove(full)
-    except OSError:
-        pass
+    file = request.files['file']
+    caption = request.form.get('caption', '')
     
-    db.execute("DELETE FROM reels WHERE id=?", (rid,))
-    db.execute("DELETE FROM reel_views WHERE reel_id=?", (rid,))
-    db.execute("DELETE FROM reel_reactions WHERE reel_id=?", (rid,))
-    db.execute("DELETE FROM reel_comments WHERE reel_id=?", (rid,))
-    db.commit()
-    return jsonify({"ok": True})
-
-@app.route("/api/reels/<int:rid>/view", methods=["POST"])
-@auth_required
-def view_reel(rid):
-    db = get_db()
-    db.execute(
-        "INSERT OR IGNORE INTO reel_views(reel_id, user_id, viewed_at) VALUES (?,?,?)",
-        (rid, g.user["id"], time.time()),
-    )
-    db.commit()
-    count = db.execute("SELECT COUNT(*) c FROM reel_views WHERE reel_id=?", (rid,)).fetchone()["c"]
-    return jsonify({"view_count": count})
-
-@app.route("/api/reels/<int:rid>/react", methods=["POST"])
-@auth_required
-def react_reel(rid):
-    emoji = (request.get_json(silent=True) or {}).get("emoji")
-    db = get_db()
-    if not emoji:
-        db.execute("DELETE FROM reel_reactions WHERE reel_id=? AND user_id=?", (rid, g.user["id"]))
-    else:
-        db.execute(
-            "INSERT INTO reel_reactions(reel_id, user_id, emoji) VALUES (?,?,?) "
-            "ON CONFLICT(reel_id, user_id) DO UPDATE SET emoji=excluded.emoji",
-            (rid, g.user["id"], emoji),
-        )
-    db.commit()
-    reactions = db.execute("SELECT user_id, emoji FROM reel_reactions WHERE reel_id=?", (rid,)).fetchall()
-    return jsonify({"reaction_counts": _count_by_emoji(reactions)})
-
-def serialize_comment(db, c):
-    author = db.execute("SELECT username, avatar FROM users WHERE id=?", (c["user_id"],)).fetchone()
-    return {
-        "id": c["id"],
-        "reel_id": c["reel_id"],
-        "user_id": c["user_id"],
-        "author_name": author["username"] if author else "Unknown",
-        "author_avatar": author["avatar"] if author else "",
-        "content": c["content"],
-        "parent_id": c["parent_id"],
-        "created_at": c["created_at"],
+    ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
+    if ext not in ALLOWED_EXTENSIONS:
+        return jsonify({'error': 'File type not allowed'}), 400
+    
+    filename = f"reel_{uuid.uuid4().hex}.{ext}"
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
+    
+    media_type = 'video' if ext in {'mp4', 'webm', 'mov'} else 'image'
+    
+    reel = {
+        'id': generate_id(),
+        'author_id': request.user_id,
+        'author_name': request.user['username'],
+        'author_avatar': request.user.get('avatar', ''),
+        'media_path': f"/uploads/{filename}",
+        'media_type': media_type,
+        'caption': caption,
+        'view_count': 0,
+        'reaction_counts': {},
+        'my_reaction': None,
+        'is_mine': True,
+        'comment_count': 0,
+        'created_at': time.time()
     }
+    DB['reels'].insert(0, reel)
+    DB['comments'][reel['id']] = []
+    
+    return jsonify({'reel': reel})
 
-@app.route("/api/reels/<int:rid>/comments", methods=["GET"])
-@auth_required
-def get_comments(rid):
-    db = get_db()
-    rows = db.execute("SELECT * FROM reel_comments WHERE reel_id=? ORDER BY id ASC", (rid,)).fetchall()
-    return jsonify({"comments": [serialize_comment(db, c) for c in rows]})
+@app.route('/api/reels/<reel_id>/view', methods=['POST'])
+@token_required
+def view_reel(reel_id):
+    for reel in DB['reels']:
+        if reel['id'] == reel_id:
+            reel['view_count'] += 1
+            return jsonify({'view_count': reel['view_count']})
+    return jsonify({'error': 'Reel not found'}), 404
 
-@app.route("/api/reels/<int:rid>/comments", methods=["POST"])
-@auth_required
-def post_comment(rid):
-    data = request.get_json(silent=True) or {}
-    content = (data.get("content") or "").strip()
-    parent_id = data.get("parent_id")
+@app.route('/api/reels/<reel_id>/react', methods=['POST'])
+@token_required
+def react_to_reel(reel_id):
+    data = request.get_json() or {}
+    emoji = data.get('emoji')
+    
+    for reel in DB['reels']:
+        if reel['id'] == reel_id:
+            if emoji is None:
+                # Remove reaction
+                if reel['my_reaction']:
+                    reel['reaction_counts'][reel['my_reaction']] = max(0, reel['reaction_counts'].get(reel['my_reaction'], 0) - 1)
+                reel['my_reaction'] = None
+            else:
+                # Remove old reaction
+                if reel['my_reaction']:
+                    reel['reaction_counts'][reel['my_reaction']] = max(0, reel['reaction_counts'].get(reel['my_reaction'], 0) - 1)
+                reel['my_reaction'] = emoji
+                reel['reaction_counts'][emoji] = reel['reaction_counts'].get(emoji, 0) + 1
+            return jsonify({'reaction_counts': reel['reaction_counts']})
+    
+    return jsonify({'error': 'Reel not found'}), 404
+
+@app.route('/api/reels/<reel_id>', methods=['DELETE'])
+@token_required
+def delete_reel(reel_id):
+    for i, reel in enumerate(DB['reels']):
+        if reel['id'] == reel_id:
+            if reel['author_id'] != request.user_id:
+                return jsonify({'error': 'Not your reel'}), 403
+            # Delete file
+            try:
+                file_path = reel['media_path'].lstrip('/')
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except:
+                pass
+            del DB['reels'][i]
+            if reel_id in DB['comments']:
+                del DB['comments'][reel_id]
+            return jsonify({'success': True})
+    return jsonify({'error': 'Reel not found'}), 404
+
+@app.route('/api/reels/<reel_id>/comments', methods=['GET'])
+@token_required
+def get_reel_comments(reel_id):
+    comments = DB['comments'].get(reel_id, [])
+    return jsonify({'comments': comments})
+
+@app.route('/api/reels/<reel_id>/comments', methods=['POST'])
+@token_required
+def add_reel_comment(reel_id):
+    data = request.get_json() or {}
+    content = data.get('content', '').strip()
+    parent_id = data.get('parent_id')
+    
     if not content:
-        return jsonify({"error": "Comment cannot be empty"}), 400
-    db = get_db()
-    reel = db.execute("SELECT 1 FROM reels WHERE id=?", (rid,)).fetchone()
-    if not reel:
-        return jsonify({"error": "Reel not found"}), 404
-    if parent_id:
-        parent = db.execute("SELECT 1 FROM reel_comments WHERE id=? AND reel_id=?", (parent_id, rid)).fetchone()
-        if not parent:
-            parent_id = None
-    cur = db.execute(
-        "INSERT INTO reel_comments(reel_id, user_id, content, parent_id, created_at) VALUES (?,?,?,?,?)",
-        (rid, g.user["id"], content, parent_id, time.time()),
-    )
-    db.commit()
-    row = db.execute("SELECT * FROM reel_comments WHERE id=?", (cur.lastrowid,)).fetchone()
-    return jsonify({"comment": serialize_comment(db, row)})
+        return jsonify({'error': 'Comment content required'}), 400
+    
+    comment = {
+        'id': generate_id(),
+        'user_id': request.user_id,
+        'author_name': request.user['username'],
+        'author_avatar': request.user.get('avatar', ''),
+        'content': content,
+        'parent_id': parent_id,
+        'created_at': time.time()
+    }
+    
+    if reel_id not in DB['comments']:
+        DB['comments'][reel_id] = []
+    DB['comments'][reel_id].append(comment)
+    
+    # Update comment count
+    for reel in DB['reels']:
+        if reel['id'] == reel_id:
+            reel['comment_count'] = len(DB['comments'][reel_id])
+            break
+    
+    return jsonify({'comment': comment})
 
-@app.route("/api/reels/comments/<int:cid>", methods=["DELETE"])
-@auth_required
-def delete_comment(cid):
-    db = get_db()
-    row = db.execute("SELECT * FROM reel_comments WHERE id=?", (cid,)).fetchone()
-    if not row or row["user_id"] != g.user["id"]:
-        return jsonify({"error": "You can only delete your own comments"}), 403
-    db.execute("DELETE FROM reel_comments WHERE id=? OR parent_id=?", (cid, cid))
-    db.commit()
-    return jsonify({"ok": True})
+@app.route('/api/reels/comments/<comment_id>', methods=['DELETE'])
+@token_required
+def delete_reel_comment(comment_id):
+    for reel_id, comments in DB['comments'].items():
+        for i, comment in enumerate(comments):
+            if comment['id'] == comment_id:
+                if comment['user_id'] != request.user_id:
+                    return jsonify({'error': 'Not your comment'}), 403
+                del comments[i]
+                # Update comment count
+                for reel in DB['reels']:
+                    if reel['id'] == reel_id:
+                        reel['comment_count'] = len(comments)
+                        break
+                return jsonify({'success': True})
+    return jsonify({'error': 'Comment not found'}), 404
 
 # ===== SOCKET.IO EVENTS =====
 
-sid_to_user = {}
-
-@socketio.on("connect")
+@socketio.on('connect')
 def handle_connect():
-    print(f"Client connected: {request.sid}")
+    print(f'Client connected: {request.sid}')
 
-@socketio.on("disconnect")
+@socketio.on('disconnect')
 def handle_disconnect():
-    uid = sid_to_user.pop(request.sid, None)
-    if uid:
-        conn = db_conn()
-        conn.execute("UPDATE users SET status='offline' WHERE id=?", (uid,))
-        conn.commit()
-        conn.close()
-    print(f"Client disconnected: {request.sid}")
+    print(f'Client disconnected: {request.sid}')
 
-@socketio.on("auth")
-def sio_auth(data):
-    token = (data or {}).get("token")
-    conn = db_conn()
-    user = conn.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
-    if not user:
-        emit("auth_error", {"error": "Invalid session"})
-        conn.close()
+@socketio.on('auth')
+def handle_auth(data):
+    token = data.get('token')
+    if not token:
+        emit('error_msg', {'error': 'Token required'})
         return
-    sid_to_user[request.sid] = user["id"]
-    join_room(f"user:{user['id']}")
-    for grow in conn.execute("SELECT group_id FROM group_members WHERE user_id=?", (user["id"],)):
-        join_room(f"group:{grow['group_id']}")
-    conn.execute("UPDATE users SET status='online' WHERE id=?", (user["id"],))
-    conn.commit()
-    conn.close()
-    emit("auth_ok", {"user_id": user["id"]})
-
-@socketio.on("send_message")
-def sio_send_message(data):
-    uid = sid_to_user.get(request.sid)
-    if not uid:
-        emit("error_msg", {"error": "Not authenticated"})
-        return
-
-    chat_type = (data or {}).get("chat_type")
-    target = (data or {}).get("target")
-    msg_type = (data or {}).get("msg_type", "text")
-    content = (data or {}).get("content", "")
-    media_path = (data or {}).get("media_path", "")
-    reply_to_id = (data or {}).get("reply_to_id")
-    client_id = (data or {}).get("client_id")
-
-    if chat_type not in ("dm", "group") or target is None:
-        emit("error_msg", {"error": "Malformed message"})
-        return
-    if msg_type == "text" and not content.strip():
-        emit("error_msg", {"error": "Empty message"})
-        return
-
-    conn = db_conn()
-    if chat_type == "dm":
-        target_user = conn.execute("SELECT 1 FROM users WHERE id=?", (target,)).fetchone()
-        if not target_user:
-            emit("error_msg", {"error": "This account no longer exists"})
-            conn.close()
+    
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+        user_id = payload['user_id']
+        if user_id in DB['users']:
+            request.user_id = user_id
+            request.user = DB['users'][user_id]
+            join_room(f'user_{user_id}')
+            emit('auth_success', {'user_id': user_id})
+            print(f'User {user_id} authenticated')
             return
-        blocked = conn.execute(
-            "SELECT 1 FROM blocks WHERE (blocker_id=? AND blocked_id=?) "
-            "OR (blocker_id=? AND blocked_id=?)",
-            (target, uid, uid, target),
-        ).fetchone()
-        if blocked:
-            emit("error_msg", {"error": "You cannot message this user"})
-            conn.close()
-            return
-        chat_id = dm_chat_id(uid, target)
-    else:
-        member = conn.execute(
-            "SELECT 1 FROM group_members WHERE group_id=? AND user_id=?", (target, uid)
-        ).fetchone()
-        if not member:
-            emit("error_msg", {"error": "Not a group member"})
-            conn.close()
-            return
-        chat_id = str(target)
+    except:
+        pass
+    
+    emit('error_msg', {'error': 'Invalid token'})
 
+@socketio.on('send_message')
+def handle_send_message(data):
+    if not hasattr(request, 'user_id'):
+        emit('error_msg', {'error': 'Not authenticated'})
+        return
+    
+    chat_type = data.get('chat_type')
+    target = data.get('target')
+    msg_type = data.get('msg_type', 'text')
+    content = data.get('content', '')
+    media_path = data.get('media_path', '')
+    client_id = data.get('client_id')
+    reply_to_id = data.get('reply_to_id')
+    
+    if not chat_type or not target:
+        emit('error_msg', {'error': 'Missing chat_type or target'})
+        return
+    
+    user = request.user
+    user_id = user['id']
+    
+    # Check if blocked
+    if chat_type == 'dm':
+        if target in user.get('blocked_ids', []):
+            emit('error_msg', {'error': 'You blocked this user'})
+            return
+        other = DB['users'].get(target)
+        if other and target in other.get('blocked_ids', []):
+            emit('error_msg', {'error': 'You are blocked by this user'})
+            return
+    
+    # Generate message
+    msg_id = generate_id()
+    sender_name = user['username']
+    sender_avatar = user.get('avatar', '')
+    
+    # Get reply_to if provided
+    reply_to = None
     if reply_to_id:
-        orig = conn.execute(
-            "SELECT 1 FROM messages WHERE id=? AND chat_type=? AND chat_id=? AND deleted=0",
-            (reply_to_id, chat_type, chat_id),
-        ).fetchone()
-        if not orig:
-            reply_to_id = None
-
-    cur = conn.execute(
-        "INSERT INTO messages(chat_type, chat_id, sender_id, msg_type, content, media_path, timestamp, reply_to_id) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (chat_type, chat_id, uid, msg_type, content, media_path, time.time(), reply_to_id),
-    )
-    conn.commit()
-    row = conn.execute("SELECT * FROM messages WHERE id=?", (cur.lastrowid,)).fetchone()
-    payload = serialize_message(conn, row)
-    payload["client_id"] = client_id
-    conn.close()
-
-    for room in rooms_for(chat_type, chat_id):
-        emit("new_message", payload, room=room)
-
-@socketio.on("forward_message")
-def sio_forward_message(data):
-    uid = sid_to_user.get(request.sid)
-    if not uid:
-        emit("error_msg", {"error": "Not authenticated"})
-        return
-    message_id = (data or {}).get("message_id")
-    chat_type = (data or {}).get("chat_type")
-    target = (data or {}).get("target")
-    client_id = (data or {}).get("client_id")
-
-    if chat_type not in ("dm", "group") or target is None or not message_id:
-        emit("error_msg", {"error": "Malformed forward request"})
-        return
-
-    conn = db_conn()
-    orig = conn.execute("SELECT * FROM messages WHERE id=? AND deleted=0", (message_id,)).fetchone()
-    if not orig:
-        emit("error_msg", {"error": "Original message not found"})
-        conn.close()
-        return
-
-    if chat_type == "dm":
-        target_user = conn.execute("SELECT 1 FROM users WHERE id=?", (target,)).fetchone()
-        if not target_user:
-            emit("error_msg", {"error": "This account no longer exists"})
-            conn.close()
-            return
-        blocked = conn.execute(
-            "SELECT 1 FROM blocks WHERE (blocker_id=? AND blocked_id=?) OR (blocker_id=? AND blocked_id=?)",
-            (target, uid, uid, target),
-        ).fetchone()
-        if blocked:
-            emit("error_msg", {"error": "You cannot message this user"})
-            conn.close()
-            return
-        chat_id = dm_chat_id(uid, target)
+        reply_msg = DB['messages'].get(reply_to_id)
+        if reply_msg:
+            reply_to = {
+                'id': reply_msg['id'],
+                'sender_name': reply_msg.get('sender_name', ''),
+                'preview': reply_msg.get('preview', reply_msg.get('content', ''))[:50],
+                'msg_type': reply_msg.get('msg_type', 'text')
+            }
+    
+    message = {
+        'id': msg_id,
+        'chat_type': chat_type,
+        'chat_id': target if chat_type == 'dm' else target,
+        'sender_id': user_id,
+        'sender_name': sender_name,
+        'sender_avatar': sender_avatar,
+        'msg_type': msg_type,
+        'content': content,
+        'media_path': media_path,
+        'timestamp': time.time(),
+        'deleted': False,
+        'edited': False,
+        'reactions': [],
+        'reply_to': reply_to,
+        'forwarded_from': None,
+        'client_id': client_id,
+        'preview': content[:50] if msg_type == 'text' else ({'image': '📷 Photo', 'video': '🎬 Video', 'voice': '🎤 Voice message'}.get(msg_type, 'Message'))
+    }
+    
+    DB['messages'][msg_id] = message
+    
+    # Update conversation
+    if chat_type == 'dm':
+        update_conversation(user_id, 'dm', target, message)
+        update_conversation(target, 'dm', user_id, message)
     else:
-        member = conn.execute(
-            "SELECT 1 FROM group_members WHERE group_id=? AND user_id=?", (target, uid)
-        ).fetchone()
-        if not member:
-            emit("error_msg", {"error": "Not a group member"})
-            conn.close()
-            return
-        chat_id = str(target)
-
-    cur = conn.execute(
-        "INSERT INTO messages(chat_type, chat_id, sender_id, msg_type, content, media_path, timestamp, forwarded_from_id) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (chat_type, chat_id, uid, orig["msg_type"], orig["content"], orig["media_path"], time.time(), orig["sender_id"]),
-    )
-    conn.commit()
-    row = conn.execute("SELECT * FROM messages WHERE id=?", (cur.lastrowid,)).fetchone()
-    payload = serialize_message(conn, row)
-    payload["client_id"] = client_id
-    conn.close()
-
-    for room in rooms_for(chat_type, chat_id):
-        emit("new_message", payload, room=room)
-
-@socketio.on("mark_read")
-def sio_mark_read(data):
-    uid = sid_to_user.get(request.sid)
-    if not uid:
-        return
-    chat_type = (data or {}).get("chat_type")
-    target = (data or {}).get("target")
-    if chat_type not in ("dm", "group") or target is None:
-        return
-    chat_id = dm_chat_id(uid, target) if chat_type == "dm" else str(target)
-    conn = db_conn()
-    last = conn.execute(
-        "SELECT MAX(id) m FROM messages WHERE chat_type=? AND chat_id=?", (chat_type, chat_id)
-    ).fetchone()
-    last_id = last["m"] or 0
-    touch_read_state(conn, uid, chat_type, chat_id, last_id)
-    conn.close()
-
-@socketio.on("delete_message")
-def sio_delete_message(data):
-    uid = sid_to_user.get(request.sid)
-    msg_id = (data or {}).get("message_id")
-    if not uid or not msg_id:
-        return
-    conn = db_conn()
-    row = conn.execute("SELECT * FROM messages WHERE id=?", (msg_id,)).fetchone()
-    if not row or row["sender_id"] != uid:
-        emit("error_msg", {"error": "You can only delete your own messages"})
-        conn.close()
-        return
-    conn.execute("UPDATE messages SET deleted=1, content='', media_path='' WHERE id=?", (msg_id,))
-    conn.commit()
-    chat_type, chat_id = row["chat_type"], row["chat_id"]
-    conn.close()
-    for room in rooms_for(chat_type, chat_id):
-        emit("message_deleted", {"message_id": msg_id}, room=room)
-
-@socketio.on("edit_message")
-def sio_edit_message(data):
-    uid = sid_to_user.get(request.sid)
-    if not uid:
-        emit("error_msg", {"error": "Not authenticated"})
-        return
-    msg_id = (data or {}).get("message_id")
-    new_content = (data or {}).get("content", "").strip()
-    if not msg_id or not new_content:
-        return
-    conn = db_conn()
-    row = conn.execute("SELECT * FROM messages WHERE id=?", (msg_id,)).fetchone()
-    if not row or row["sender_id"] != uid or row["deleted"] or row["msg_type"] != "text":
-        emit("error_msg", {"error": "This message can't be edited"})
-        conn.close()
-        return
-    conn.execute("UPDATE messages SET content=?, edited=1 WHERE id=?", (new_content, msg_id))
-    conn.commit()
-    chat_type, chat_id = row["chat_type"], row["chat_id"]
-    conn.close()
-    for room in rooms_for(chat_type, chat_id):
-        emit("message_edited", {"message_id": msg_id, "content": new_content}, room=room)
-
-@socketio.on("react_message")
-def sio_react(data):
-    uid = sid_to_user.get(request.sid)
-    if not uid:
-        return
-    msg_id = (data or {}).get("message_id")
-    emoji = (data or {}).get("emoji")
-    if not msg_id or not emoji:
-        return
-    conn = db_conn()
-    row = conn.execute("SELECT * FROM messages WHERE id=?", (msg_id,)).fetchone()
-    if not row:
-        conn.close()
-        return
-    conn.execute(
-        "INSERT INTO reactions(message_id, user_id, emoji) VALUES (?,?,?) "
-        "ON CONFLICT(message_id, user_id) DO UPDATE SET emoji=excluded.emoji",
-        (msg_id, uid, emoji),
-    )
-    conn.commit()
-    chat_type, chat_id = row["chat_type"], row["chat_id"]
-    conn.close()
-    for room in rooms_for(chat_type, chat_id):
-        emit("message_reacted", {"message_id": msg_id, "user_id": uid, "emoji": emoji}, room=room)
-
-@socketio.on("typing")
-def sio_typing(data):
-    uid = sid_to_user.get(request.sid)
-    if not uid:
-        return
-    chat_type = (data or {}).get("chat_type")
-    target = (data or {}).get("target")
-    if chat_type not in ("dm", "group") or target is None:
-        return
-    if chat_type == "dm":
-        emit("typing", {"from": uid}, room=f"user:{target}")
+        group = DB['groups'].get(target)
+        if group:
+            for member_id in group.get('members', []):
+                update_conversation(member_id, 'group', target, message)
+    
+    # Broadcast to recipients
+    formatted_msg = format_message(message)
+    
+    if chat_type == 'dm':
+        # Send to sender and recipient
+        emit('new_message', formatted_msg, room=f'user_{user_id}')
+        emit('new_message', formatted_msg, room=f'user_{target}')
     else:
-        emit("typing", {"from": uid}, room=f"group:{target}", include_self=False)
+        # Send to all group members
+        group = DB['groups'].get(target)
+        if group:
+            for member_id in group.get('members', []):
+                emit('new_message', formatted_msg, room=f'user_{member_id}')
+    
+    return formatted_msg
+
+@socketio.on('edit_message')
+def handle_edit_message(data):
+    if not hasattr(request, 'user_id'):
+        emit('error_msg', {'error': 'Not authenticated'})
+        return
+    
+    message_id = data.get('message_id')
+    content = data.get('content', '')
+    
+    msg = DB['messages'].get(message_id)
+    if not msg:
+        emit('error_msg', {'error': 'Message not found'})
+        return
+    
+    if msg['sender_id'] != request.user_id:
+        emit('error_msg', {'error': 'Not your message'})
+        return
+    
+    msg['content'] = content
+    msg['edited'] = True
+    
+    emit('message_edited', {'message_id': message_id, 'content': content}, room=f'user_{msg["sender_id"]}')
+    if msg['chat_type'] == 'dm':
+        emit('message_edited', {'message_id': message_id, 'content': content}, room=f'user_{msg["chat_id"]}')
+    else:
+        group = DB['groups'].get(msg['chat_id'])
+        if group:
+            for member_id in group.get('members', []):
+                emit('message_edited', {'message_id': message_id, 'content': content}, room=f'user_{member_id}')
+
+@socketio.on('delete_message')
+def handle_delete_message(data):
+    if not hasattr(request, 'user_id'):
+        emit('error_msg', {'error': 'Not authenticated'})
+        return
+    
+    message_id = data.get('message_id')
+    msg = DB['messages'].get(message_id)
+    if not msg:
+        emit('error_msg', {'error': 'Message not found'})
+        return
+    
+    if msg['sender_id'] != request.user_id:
+        emit('error_msg', {'error': 'Not your message'})
+        return
+    
+    msg['deleted'] = True
+    
+    emit('message_deleted', {'message_id': message_id}, room=f'user_{msg["sender_id"]}')
+    if msg['chat_type'] == 'dm':
+        emit('message_deleted', {'message_id': message_id}, room=f'user_{msg["chat_id"]}')
+    else:
+        group = DB['groups'].get(msg['chat_id'])
+        if group:
+            for member_id in group.get('members', []):
+                emit('message_deleted', {'message_id': message_id}, room=f'user_{member_id}')
+
+@socketio.on('react_message')
+def handle_react_message(data):
+    if not hasattr(request, 'user_id'):
+        emit('error_msg', {'error': 'Not authenticated'})
+        return
+    
+    message_id = data.get('message_id')
+    emoji = data.get('emoji')
+    
+    msg = DB['messages'].get(message_id)
+    if not msg:
+        emit('error_msg', {'error': 'Message not found'})
+        return
+    
+    if msg.get('deleted'):
+        return
+    
+    reactions = msg.get('reactions', [])
+    user_id = request.user_id
+    
+    # Remove existing reaction from this user
+    reactions = [r for r in reactions if r['user_id'] != user_id]
+    
+    if emoji:
+        reactions.append({'user_id': user_id, 'emoji': emoji})
+    
+    msg['reactions'] = reactions
+    
+    emit('message_reacted', {'message_id': message_id, 'user_id': user_id, 'emoji': emoji}, room=f'user_{msg["sender_id"]}')
+    if msg['chat_type'] == 'dm':
+        emit('message_reacted', {'message_id': message_id, 'user_id': user_id, 'emoji': emoji}, room=f'user_{msg["chat_id"]}')
+    else:
+        group = DB['groups'].get(msg['chat_id'])
+        if group:
+            for member_id in group.get('members', []):
+                emit('message_reacted', {'message_id': message_id, 'user_id': user_id, 'emoji': emoji}, room=f'user_{member_id}')
+
+@socketio.on('forward_message')
+def handle_forward_message(data):
+    if not hasattr(request, 'user_id'):
+        emit('error_msg', {'error': 'Not authenticated'})
+        return
+    
+    message_id = data.get('message_id')
+    chat_type = data.get('chat_type')
+    target = data.get('target')
+    
+    original_msg = DB['messages'].get(message_id)
+    if not original_msg:
+        emit('error_msg', {'error': 'Message not found'})
+        return
+    
+    # Create forwarded message
+    forwarded = original_msg.copy()
+    forwarded['id'] = generate_id()
+    forwarded['chat_type'] = chat_type
+    forwarded['chat_id'] = target if chat_type == 'dm' else target
+    forwarded['sender_id'] = request.user_id
+    forwarded['sender_name'] = request.user['username']
+    forwarded['forwarded_from'] = {
+        'id': original_msg['id'],
+        'sender_name': original_msg.get('sender_name', '')
+    }
+    forwarded['timestamp'] = time.time()
+    forwarded['reactions'] = []
+    
+    DB['messages'][forwarded['id']] = forwarded
+    
+    formatted_msg = format_message(forwarded)
+    
+    if chat_type == 'dm':
+        emit('new_message', formatted_msg, room=f'user_{request.user_id}')
+        emit('new_message', formatted_msg, room=f'user_{target}')
+    else:
+        group = DB['groups'].get(target)
+        if group:
+            for member_id in group.get('members', []):
+                emit('new_message', formatted_msg, room=f'user_{member_id}')
+
+@socketio.on('typing')
+def handle_typing(data):
+    if not hasattr(request, 'user_id'):
+        return
+    
+    chat_type = data.get('chat_type')
+    target = data.get('target')
+    
+    if chat_type == 'dm':
+        emit('typing', {'from': request.user_id, 'chat_type': 'dm'}, room=f'user_{target}')
+    else:
+        group = DB['groups'].get(target)
+        if group:
+            for member_id in group.get('members', []):
+                if member_id != request.user_id:
+                    emit('typing', {'from': request.user_id, 'chat_type': 'group', 'group_id': target}, room=f'user_{member_id}')
+
+@socketio.on('mark_read')
+def handle_mark_read(data):
+    if not hasattr(request, 'user_id'):
+        return
+    
+    chat_type = data.get('chat_type')
+    target = data.get('target')
+    
+    key = get_conversation_key(chat_type, target)
+    if key in DB['conversations']:
+        DB['conversations'][key]['unread'] = 0
 
 # ===== CALL EVENTS =====
 
-@socketio.on("call_offer")
-def sio_call_offer(data):
-    uid = sid_to_user.get(request.sid)
-    if not uid:
+@socketio.on('call_offer')
+def handle_call_offer(data):
+    if not hasattr(request, 'user_id'):
+        emit('error_msg', {'error': 'Not authenticated'})
         return
-    target = (data or {}).get("target")
-    offer = (data or {}).get("offer")
-    call_type = (data or {}).get("call_type", "audio")
-    if target is None or not offer:
+    
+    target = data.get('target')
+    offer = data.get('offer')
+    call_type = data.get('call_type', 'audio')
+    
+    user = request.user
+    
+    emit('call_offer', {
+        'from': user['id'],
+        'from_name': user['username'],
+        'from_avatar': user.get('avatar', ''),
+        'offer': offer,
+        'call_type': call_type
+    }, room=f'user_{target}')
+
+@socketio.on('call_answer')
+def handle_call_answer(data):
+    if not hasattr(request, 'user_id'):
+        emit('error_msg', {'error': 'Not authenticated'})
         return
-    conn = db_conn()
-    caller = conn.execute("SELECT username, avatar FROM users WHERE id=?", (uid,)).fetchone()
-    conn.close()
-    emit("call_offer", {
-        "from": uid,
-        "from_name": caller["username"] if caller else "Unknown",
-        "from_avatar": caller["avatar"] if caller else "",
-        "call_type": call_type,
-        "offer": offer,
-    }, room=f"user:{target}")
+    
+    target = data.get('target')
+    answer = data.get('answer')
+    
+    emit('call_answer', {'from': request.user_id, 'answer': answer}, room=f'user_{target}')
 
-@socketio.on("call_answer")
-def sio_call_answer(data):
-    uid = sid_to_user.get(request.sid)
-    if not uid:
+@socketio.on('call_ice_candidate')
+def handle_ice_candidate(data):
+    if not hasattr(request, 'user_id'):
         return
-    target = (data or {}).get("target")
-    answer = (data or {}).get("answer")
-    if target is None or not answer:
+    
+    target = data.get('target')
+    candidate = data.get('candidate')
+    
+    emit('call_ice_candidate', {'from': request.user_id, 'candidate': candidate}, room=f'user_{target}')
+
+@socketio.on('call_reject')
+def handle_call_reject(data):
+    if not hasattr(request, 'user_id'):
         return
-    emit("call_answer", {"from": uid, "answer": answer}, room=f"user:{target}")
+    
+    target = data.get('target')
+    reason = data.get('reason', 'declined')
+    
+    emit('call_reject', {'from': request.user_id, 'reason': reason}, room=f'user_{target}')
 
-@socketio.on("call_ice_candidate")
-def sio_call_ice(data):
-    uid = sid_to_user.get(request.sid)
-    if not uid:
+@socketio.on('call_end')
+def handle_call_end(data):
+    if not hasattr(request, 'user_id'):
         return
-    target = (data or {}).get("target")
-    candidate = (data or {}).get("candidate")
-    if target is None or not candidate:
-        return
-    emit("call_ice_candidate", {"from": uid, "candidate": candidate}, room=f"user:{target}")
+    
+    target = data.get('target')
+    
+    emit('call_end', {'from': request.user_id}, room=f'user_{target}')
 
-@socketio.on("call_reject")
-def sio_call_reject(data):
-    uid = sid_to_user.get(request.sid)
-    if not uid:
-        return
-    target = (data or {}).get("target")
-    if target is None:
-        return
-    emit("call_reject", {"from": uid, "reason": (data or {}).get("reason", "declined")}, room=f"user:{target}")
+# ===== ERROR HANDLING =====
 
-@socketio.on("call_end")
-def sio_call_end(data):
-    uid = sid_to_user.get(request.sid)
-    if not uid:
-        return
-    target = (data or {}).get("target")
-    if target is None:
-        return
-    emit("call_end", {"from": uid}, room=f"user:{target}")
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# ===== FRONTEND =====
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'error': 'Not found'}), 404
 
-@app.route("/")
-def index():
-    return send_from_directory(BASE_DIR, "hm.html")
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({'error': 'Internal server error'}), 500
 
-def try_start_public_tunnel():
-    global PUBLIC_BASE_URL
-    if PUBLIC_BASE_URL and PUBLIC_BASE_URL != "http://localhost:5000":
-        print(f"Using configured public URL: {PUBLIC_BASE_URL}")
-        return
+# ===== RUN SERVER =====
 
-    def runner():
-        global PUBLIC_BASE_URL
-        try:
-            proc = subprocess.Popen(
-                ["cloudflared", "tunnel", "--url", "http://localhost:5000"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
-            )
-        except FileNotFoundError:
-            print("\nNote: Install cloudflared for public invite links:\n    pkg install cloudflared (Termux)\n")
-            return
-        pattern = re.compile(r"https://[a-zA-Z0-9\-]+\.trycloudflare\.com")
-        for line in proc.stdout:
-            m = pattern.search(line)
-            if m:
-                PUBLIC_BASE_URL = m.group(0)
-                print(f"\n✔ Public URL: {PUBLIC_BASE_URL}\n")
-                break
-
-    threading.Thread(target=runner, daemon=True).start()
-
-# ===== RUN =====
-
-if __name__ == "__main__":
-    print("🚀 HM Chat Server starting on http://0.0.0.0:5000")
-    print(f"📡 Invite links will use: {PUBLIC_BASE_URL}")
-    try_start_public_tunnel()
-    socketio.run(app, host="0.0.0.0", port=5000, debug=True)
+if __name__ == '__main__':
+    print(f"🚀 HM Chat Server running on port {PORT}")
+    print(f"📡 Socket.IO enabled")
+    print(f"🔑 JWT Secret: {JWT_SECRET[:8]}...")
+    print(f"📁 Upload folder: {UPLOAD_FOLDER}")
+    socketio.run(app, host='0.0.0.0', port=PORT, debug=True, allow_unsafe_werkzeug=True)
