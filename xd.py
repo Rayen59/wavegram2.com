@@ -51,8 +51,8 @@ CORS(app, origins='*')
 # Create upload folder if it doesn't exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# ===== SOCKET.IO =====
-socketio = SocketIO(app, cors_allowed_origins='*', async_mode='eventlet', ping_timeout=60)
+# ===== SOCKET.IO (Corrigé pour éviter l'erreur async_mode sur Render) =====
+socketio = SocketIO(app, cors_allowed_origins='*', ping_timeout=60)
 
 # ===== AUTHENTICATION DECORATOR =====
 def token_required(f):
@@ -118,7 +118,6 @@ def update_conversation(user_id, chat_type, chat_id, message):
         if message.get('sender_id') != user_id:
             conv['unread'] = conv.get('unread', 0) + 1
     else:
-        # Create new conversation
         if chat_type == 'dm':
             other_user = DB['users'].get(chat_id)
             name = other_user['username'] if other_user else 'Unknown'
@@ -180,7 +179,7 @@ def get_config():
 
 @app.route('/api/register', methods=['POST'])
 def register():
-    data = request.get_json()
+    data = request.get_json() or {}
     username = data.get('username', '').strip()
     email = data.get('email', '').strip().lower()
     password = data.get('password', '')
@@ -191,7 +190,6 @@ def register():
     if len(password) < 4:
         return jsonify({'error': 'Password must be at least 4 characters'}), 400
     
-    # Check if username or email already exists
     for user in DB['users'].values():
         if user['username'].lower() == username.lower():
             return jsonify({'error': 'Username already taken'}), 400
@@ -221,11 +219,10 @@ def register():
 
 @app.route('/api/login', methods=['POST'])
 def login():
-    data = request.get_json()
+    data = request.get_json() or {}
     email = data.get('email', '').strip().lower()
     password = data.get('password', '')
     
-    # Find user by email
     user = None
     for u in DB['users'].values():
         if u['email'].lower() == email:
@@ -240,8 +237,6 @@ def login():
     
     token = generate_token(user['id'])
     DB['sessions'][token] = user['id']
-    
-    # Update status
     user['status'] = 'online'
     
     return jsonify({
@@ -283,7 +278,6 @@ def update_profile():
     if 'username' in data:
         username = data['username'].strip()
         if username:
-            # Check if username is taken
             for u in DB['users'].values():
                 if u['id'] != user['id'] and u['username'].lower() == username.lower():
                     return jsonify({'error': 'Username already taken'}), 400
@@ -311,7 +305,6 @@ def get_conversations():
     convs = []
     for key, conv in DB['conversations'].items():
         if key.startswith('dm:') and conv['id'] != user_id:
-            # Check if blocked
             other_id = conv['id']
             if other_id in request.user.get('blocked_ids', []):
                 continue
@@ -325,11 +318,10 @@ def get_conversations():
             'avatar': conv.get('avatar', ''),
             'last_preview': conv.get('last_message', ''),
             'last_timestamp': conv.get('last_timestamp', time.time()),
-            'last_is_mine': False,  # Simplified
+            'last_is_mine': False,
             'unread': conv.get('unread', 0),
             'status': 'online' if conv['type'] == 'dm' and DB['users'].get(conv['id'], {}).get('status') == 'online' else 'offline'
         })
-    # Sort by last_timestamp
     convs.sort(key=lambda x: x.get('last_timestamp', 0), reverse=True)
     return jsonify({'conversations': convs})
 
@@ -344,7 +336,6 @@ def get_unread_total():
 @app.route('/api/messages/dm/<user_id>', methods=['GET'])
 @token_required
 def get_dm_messages(user_id):
-    # Check if blocked
     if user_id in request.user.get('blocked_ids', []):
         return jsonify({'error': 'Blocked'}), 403
     other = DB['users'].get(user_id)
@@ -388,7 +379,6 @@ def hide_message(message_id):
     msg = DB['messages'].get(message_id)
     if not msg:
         return jsonify({'error': 'Message not found'}), 404
-    # Delete for me (soft delete)
     msg['deleted'] = True
     return jsonify({'success': True})
 
@@ -402,14 +392,12 @@ def upload_file():
     if not file:
         return jsonify({'error': 'No file provided'}), 400
     
-    # Determine file type
     filename = secure_filename(file.filename)
     ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
     
     if ext not in ALLOWED_EXTENSIONS:
         return jsonify({'error': 'File type not allowed'}), 400
     
-    # Generate unique filename
     new_filename = f"{uuid.uuid4().hex}.{ext}"
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], new_filename)
     file.save(filepath)
@@ -425,7 +413,7 @@ def serve_upload(filename):
 @app.route('/api/groups', methods=['POST'])
 @token_required
 def create_group():
-    data = request.get_json()
+    data = request.get_json() or {}
     name = data.get('name', '').strip()
     password = data.get('password', '')
     
@@ -445,8 +433,6 @@ def create_group():
         'created_at': time.time()
     }
     DB['groups'][group_id] = group
-    
-    # Create conversation
     get_or_create_conversation(request.user_id, 'group', group_id, name, '')
     
     return jsonify({'group': group})
@@ -529,7 +515,6 @@ def join_group(invite_token):
     if request.user_id in group.get('members', []):
         return jsonify({'error': 'Already a member'}), 400
     
-    # Check password
     if group.get('has_password'):
         data = request.get_json() or {}
         password = data.get('password', '')
@@ -537,8 +522,6 @@ def join_group(invite_token):
             return jsonify({'error': 'Incorrect password'}), 403
     
     group['members'].append(request.user_id)
-    
-    # Create conversation
     get_or_create_conversation(request.user_id, 'group', group['id'], group['name'], group.get('avatar', ''))
     
     return jsonify({'success': True})
@@ -548,7 +531,7 @@ def join_group(invite_token):
 @app.route('/api/block', methods=['POST'])
 @token_required
 def block_user():
-    data = request.get_json()
+    data = request.get_json() or {}
     user_id = data.get('user_id')
     if not user_id:
         return jsonify({'error': 'User ID required'}), 400
@@ -567,7 +550,7 @@ def block_user():
 @app.route('/api/unblock', methods=['POST'])
 @token_required
 def unblock_user():
-    data = request.get_json()
+    data = request.get_json() or {}
     user_id = data.get('user_id')
     if not user_id:
         return jsonify({'error': 'User ID required'}), 400
@@ -607,27 +590,21 @@ def delete_account():
         return jsonify({'error': 'Incorrect password'}), 403
     
     user_id = request.user_id
-    
-    # Delete user
     if user_id in DB['users']:
         del DB['users'][user_id]
     
-    # Delete sessions
     for token, uid in list(DB['sessions'].items()):
         if uid == user_id:
             del DB['sessions'][token]
     
-    # Delete messages (soft delete)
     for msg in DB['messages'].values():
         if msg['sender_id'] == user_id:
             msg['deleted'] = True
     
-    # Remove from groups
     for group in list(DB['groups'].values()):
         if user_id in group.get('members', []):
             group['members'].remove(user_id)
         if group.get('admin_id') == user_id:
-            # Transfer admin to first member or delete group
             if group.get('members'):
                 group['admin_id'] = group['members'][0]
             else:
@@ -640,7 +617,7 @@ def delete_account():
 @app.route('/api/reels', methods=['GET'])
 @token_required
 def get_reels():
-    return jsonify({'reels': DB['reels'][:50]})  # Limit to 50
+    return jsonify({'reels': DB['reels'][:50]})
 
 @app.route('/api/reels', methods=['POST'])
 @token_required
@@ -699,12 +676,10 @@ def react_to_reel(reel_id):
     for reel in DB['reels']:
         if reel['id'] == reel_id:
             if emoji is None:
-                # Remove reaction
                 if reel['my_reaction']:
                     reel['reaction_counts'][reel['my_reaction']] = max(0, reel['reaction_counts'].get(reel['my_reaction'], 0) - 1)
                 reel['my_reaction'] = None
             else:
-                # Remove old reaction
                 if reel['my_reaction']:
                     reel['reaction_counts'][reel['my_reaction']] = max(0, reel['reaction_counts'].get(reel['my_reaction'], 0) - 1)
                 reel['my_reaction'] = emoji
@@ -720,7 +695,6 @@ def delete_reel(reel_id):
         if reel['id'] == reel_id:
             if reel['author_id'] != request.user_id:
                 return jsonify({'error': 'Not your reel'}), 403
-            # Delete file
             try:
                 file_path = reel['media_path'].lstrip('/')
                 if os.path.exists(file_path):
@@ -763,7 +737,6 @@ def add_reel_comment(reel_id):
         DB['comments'][reel_id] = []
     DB['comments'][reel_id].append(comment)
     
-    # Update comment count
     for reel in DB['reels']:
         if reel['id'] == reel_id:
             reel['comment_count'] = len(DB['comments'][reel_id])
@@ -780,7 +753,6 @@ def delete_reel_comment(comment_id):
                 if comment['user_id'] != request.user_id:
                     return jsonify({'error': 'Not your comment'}), 403
                 del comments[i]
-                # Update comment count
                 for reel in DB['reels']:
                     if reel['id'] == reel_id:
                         reel['comment_count'] = len(comments)
@@ -813,7 +785,6 @@ def handle_auth(data):
             request.user = DB['users'][user_id]
             join_room(f'user_{user_id}')
             emit('auth_success', {'user_id': user_id})
-            print(f'User {user_id} authenticated')
             return
     except:
         pass
@@ -841,7 +812,6 @@ def handle_send_message(data):
     user = request.user
     user_id = user['id']
     
-    # Check if blocked
     if chat_type == 'dm':
         if target in user.get('blocked_ids', []):
             emit('error_msg', {'error': 'You blocked this user'})
@@ -851,12 +821,10 @@ def handle_send_message(data):
             emit('error_msg', {'error': 'You are blocked by this user'})
             return
     
-    # Generate message
     msg_id = generate_id()
     sender_name = user['username']
     sender_avatar = user.get('avatar', '')
     
-    # Get reply_to if provided
     reply_to = None
     if reply_to_id:
         reply_msg = DB['messages'].get(reply_to_id)
@@ -871,7 +839,7 @@ def handle_send_message(data):
     message = {
         'id': msg_id,
         'chat_type': chat_type,
-        'chat_id': target if chat_type == 'dm' else target,
+        'chat_id': target,
         'sender_id': user_id,
         'sender_name': sender_name,
         'sender_avatar': sender_avatar,
@@ -890,7 +858,6 @@ def handle_send_message(data):
     
     DB['messages'][msg_id] = message
     
-    # Update conversation
     if chat_type == 'dm':
         update_conversation(user_id, 'dm', target, message)
         update_conversation(target, 'dm', user_id, message)
@@ -900,15 +867,12 @@ def handle_send_message(data):
             for member_id in group.get('members', []):
                 update_conversation(member_id, 'group', target, message)
     
-    # Broadcast to recipients
     formatted_msg = format_message(message)
     
     if chat_type == 'dm':
-        # Send to sender and recipient
         emit('new_message', formatted_msg, room=f'user_{user_id}')
         emit('new_message', formatted_msg, room=f'user_{target}')
     else:
-        # Send to all group members
         group = DB['groups'].get(target)
         if group:
             for member_id in group.get('members', []):
@@ -983,32 +947,22 @@ def handle_react_message(data):
     emoji = data.get('emoji')
     
     msg = DB['messages'].get(message_id)
-    if not msg:
-        emit('error_msg', {'error': 'Message not found'})
+    if not msg or msg.get('deleted'):
         return
     
-    if msg.get('deleted'):
-        return
-    
-    reactions = msg.get('reactions', [])
-    user_id = request.user_id
-    
-    # Remove existing reaction from this user
-    reactions = [r for r in reactions if r['user_id'] != user_id]
-    
+    reactions = [r for r in msg.get('reactions', []) if r['user_id'] != request.user_id]
     if emoji:
-        reactions.append({'user_id': user_id, 'emoji': emoji})
-    
+        reactions.append({'user_id': request.user_id, 'emoji': emoji})
     msg['reactions'] = reactions
     
-    emit('message_reacted', {'message_id': message_id, 'user_id': user_id, 'emoji': emoji}, room=f'user_{msg["sender_id"]}')
+    emit('message_reacted', {'message_id': message_id, 'user_id': request.user_id, 'emoji': emoji}, room=f'user_{msg["sender_id"]}')
     if msg['chat_type'] == 'dm':
-        emit('message_reacted', {'message_id': message_id, 'user_id': user_id, 'emoji': emoji}, room=f'user_{msg["chat_id"]}')
+        emit('message_reacted', {'message_id': message_id, 'user_id': request.user_id, 'emoji': emoji}, room=f'user_{msg["chat_id"]}')
     else:
         group = DB['groups'].get(msg['chat_id'])
         if group:
             for member_id in group.get('members', []):
-                emit('message_reacted', {'message_id': message_id, 'user_id': user_id, 'emoji': emoji}, room=f'user_{member_id}')
+                emit('message_reacted', {'message_id': message_id, 'user_id': request.user_id, 'emoji': emoji}, room=f'user_{member_id}')
 
 @socketio.on('forward_message')
 def handle_forward_message(data):
@@ -1025,11 +979,10 @@ def handle_forward_message(data):
         emit('error_msg', {'error': 'Message not found'})
         return
     
-    # Create forwarded message
     forwarded = original_msg.copy()
     forwarded['id'] = generate_id()
     forwarded['chat_type'] = chat_type
-    forwarded['chat_id'] = target if chat_type == 'dm' else target
+    forwarded['chat_id'] = target
     forwarded['sender_id'] = request.user_id
     forwarded['sender_name'] = request.user['username']
     forwarded['forwarded_from'] = {
@@ -1040,7 +993,6 @@ def handle_forward_message(data):
     forwarded['reactions'] = []
     
     DB['messages'][forwarded['id']] = forwarded
-    
     formatted_msg = format_message(forwarded)
     
     if chat_type == 'dm':
@@ -1094,7 +1046,6 @@ def handle_call_offer(data):
     call_type = data.get('call_type', 'audio')
     
     user = request.user
-    
     emit('call_offer', {
         'from': user['id'],
         'from_name': user['username'],
@@ -1111,7 +1062,6 @@ def handle_call_answer(data):
     
     target = data.get('target')
     answer = data.get('answer')
-    
     emit('call_answer', {'from': request.user_id, 'answer': answer}, room=f'user_{target}')
 
 @socketio.on('call_ice_candidate')
@@ -1121,7 +1071,6 @@ def handle_ice_candidate(data):
     
     target = data.get('target')
     candidate = data.get('candidate')
-    
     emit('call_ice_candidate', {'from': request.user_id, 'candidate': candidate}, room=f'user_{target}')
 
 @socketio.on('call_reject')
@@ -1131,7 +1080,6 @@ def handle_call_reject(data):
     
     target = data.get('target')
     reason = data.get('reason', 'declined')
-    
     emit('call_reject', {'from': request.user_id, 'reason': reason}, room=f'user_{target}')
 
 @socketio.on('call_end')
@@ -1140,7 +1088,6 @@ def handle_call_end(data):
         return
     
     target = data.get('target')
-    
     emit('call_end', {'from': request.user_id}, room=f'user_{target}')
 
 # ===== ERROR HANDLING =====
